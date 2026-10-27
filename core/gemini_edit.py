@@ -1,0 +1,727 @@
+"""
+Gemini 原生 API 改图后端
+
+支持特性:
+- gemini-3-pro-image-preview 模型
+- 4K 高分辨率输出
+- API Key 轮询
+- 代理支持
+- 详细日志
+"""
+
+import asyncio
+import base64
+import re
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import aiohttp
+
+from astrbot.api import logger
+
+from .retry_config import parse_max_retries
+
+from .image_format import guess_image_mime_and_ext
+from .request_body import merge_request_body
+from .output_spec import (
+    OutputIntent,
+    aspect_ratio_from_size,
+    resolution_from_size,
+)
+
+if TYPE_CHECKING:
+    from .image_manager import ImageManager
+
+
+class GeminiEditBackend:
+    supports_ordered_references = True
+
+    """Gemini 原生 API 图像后端（文生图 + 改图）。"""
+
+    name = "Gemini"
+
+    def __init__(self, *, imgr: "ImageManager", settings: dict):
+        self.imgr = imgr
+
+        conf = settings if isinstance(settings, dict) else {}
+        self.extra_body = conf.get("extra_body", {})
+        self.api_url = conf.get("api_url", "https://generativelanguage.googleapis.com")
+        self.model = conf.get("model", "gemini-3-pro-image-preview")
+        self.resolution = conf.get("resolution", "4K")
+        self.timeout = max(1, min(int(conf.get("timeout", 600) or 600), 3600))
+        self.max_retries = min(parse_max_retries(conf.get("max_retries")), 10)
+        self.use_proxy = conf.get("use_proxy", False)
+        self.proxy_url = conf.get("proxy_url", "")
+        self.output_format = (
+            str(conf.get("output_format", "jpeg") or "jpeg").strip().lower()
+        )
+
+        raw_keys = conf.get("api_keys", [])
+        self.api_keys = [str(k).strip() for k in raw_keys if str(k).strip()]
+        self._key_index = 0
+        self._key_lock = asyncio.Lock()
+
+        # HTTP Session (带锁保护)
+        self._session: aiohttp.ClientSession | None = None
+        self._session_lock = asyncio.Lock()
+
+    @staticmethod
+    def _normalize_models_base_url(raw: str) -> str:
+        """
+        Normalize Gemini native api_url into ".../v1beta/models".
+
+        Accepts:
+        - https://generativelanguage.googleapis.com
+        - https://generativelanguage.googleapis.com/v1beta
+        - https://generativelanguage.googleapis.com/v1beta/models
+        - https://proxy.example.com/v1/chat/completions (will be rewritten to v1beta/models)
+        """
+        s = str(raw or "").strip().rstrip("/")
+        if not s:
+            return ""
+
+        lower = s.lower()
+        for suffix in (
+            "/v1/chat/completions",
+            "/chat/completions",
+            "/v1/images/generations",
+            "/images/generations",
+            "/v1/completions",
+            "/completions",
+        ):
+            if lower.endswith(suffix):
+                s = s[: -len(suffix)].rstrip("/")
+                lower = s.lower()
+                break
+
+        if lower.endswith("/v1"):
+            s = s[:-3].rstrip("/")
+            lower = s.lower()
+
+        if lower.endswith("/v1beta/models"):
+            return s
+        if lower.endswith("/v1beta"):
+            return f"{s}/models"
+
+        return f"{s}/v1beta/models"
+
+    def _build_url(self) -> str:
+        base = self._normalize_models_base_url(self.api_url)
+        return f"{base}/{self.model}:generateContent"
+
+    def _proxy(self) -> str | None:
+        return self.proxy_url if self.use_proxy and self.proxy_url else None
+
+    @staticmethod
+    def _size_to_resolution(size: str | None) -> str | None:
+        s = str(size or "").strip().lower().replace("×", "x")
+        if not s:
+            return None
+        if s == "1024x1024":
+            return "1K"
+        if s == "2048x2048":
+            return "2K"
+        if s == "4096x4096":
+            return "4K"
+        return None
+
+    @staticmethod
+    def _collect_text_parts(data: dict) -> list[str]:
+        texts: list[str] = []
+        for candidate in data.get("candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content")
+            if not isinstance(content, dict):
+                continue
+            for part in content.get("parts", []):
+                if not isinstance(part, dict):
+                    continue
+                txt = part.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    texts.append(txt.strip())
+
+        for key in ("text", "output_text", "response", "message"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.append(value.strip())
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for t in texts:
+            if t not in seen:
+                seen.add(t)
+                ordered.append(t)
+        return ordered
+
+    @staticmethod
+    def _extract_data_uri_images_from_texts(texts: list[str]) -> list[bytes]:
+        pattern = re.compile(
+            r"data\s*:\s*image/([a-zA-Z0-9.+-]+)\s*;\s*base64\s*,\s*([-A-Za-z0-9+/=_\s]+)",
+            flags=re.IGNORECASE,
+        )
+        images: list[bytes] = []
+        for text in texts:
+            for _img_fmt, b64_data in pattern.findall(text):
+                cleaned = re.sub(r"[^A-Za-z0-9+/=_-]", "", b64_data)
+                if not cleaned:
+                    continue
+                try:
+                    images.append(base64.b64decode(cleaned, validate=False))
+                except Exception:
+                    continue
+        return images
+
+    @staticmethod
+    def _extract_image_urls_from_texts(texts: list[str]) -> list[str]:
+        markdown_pattern = re.compile(
+            r"!\[[^\]]*\]\((https?://[^)]+)\)", flags=re.IGNORECASE
+        )
+        raw_pattern = re.compile(r"https?://[^\s)>\"]+", flags=re.IGNORECASE)
+
+        urls: list[str] = []
+        seen: set[str] = set()
+
+        def push(url: str):
+            u = str(url).strip().replace("&amp;", "&").strip("'\"").rstrip(").,;")
+            if not u:
+                return
+            if u in seen:
+                return
+            seen.add(u)
+            urls.append(u)
+
+        for text in texts:
+            for match in markdown_pattern.findall(text):
+                push(match)
+            for match in raw_pattern.findall(text):
+                push(match)
+        return urls
+
+    @staticmethod
+    def _extract_image_urls_from_payload(data: dict) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        likely_keys = {
+            "url",
+            "uri",
+            "image",
+            "image_url",
+            "imageurl",
+            "fileuri",
+            "file_url",
+            "output_url",
+        }
+        likely_tokens = (
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".gif",
+            "image",
+            "download?",
+        )
+
+        def push(url: str):
+            u = str(url).strip().replace("&amp;", "&").strip("'\"").rstrip(").,;")
+            if not (u.startswith("http://") or u.startswith("https://")):
+                return
+            if u in seen:
+                return
+            seen.add(u)
+            urls.append(u)
+
+        def walk(node, key_hint: str = ""):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    walk(v, str(k))
+                return
+            if isinstance(node, list):
+                for item in node:
+                    walk(item, key_hint)
+                return
+            if not isinstance(node, str):
+                return
+
+            s = node.strip()
+            if not (s.startswith("http://") or s.startswith("https://")):
+                return
+
+            lk = key_hint.lower()
+            sl = s.lower()
+            if lk in likely_keys or any(tok in sl for tok in likely_tokens):
+                push(s)
+
+        walk(data)
+        return urls
+
+    async def _download_image_bytes(self, url: str) -> bytes:
+        session = await self._get_session()
+        proxy = self._proxy()
+        req_timeout = aiohttp.ClientTimeout(total=max(5, min(int(self.timeout), 20)))
+        async with session.get(url, proxy=proxy, timeout=req_timeout) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}")
+            content_type = str(resp.headers.get("Content-Type") or "").lower()
+            if content_type and (
+                "image" not in content_type and "octet-stream" not in content_type
+            ):
+                raise RuntimeError(f"unexpected content-type: {content_type}")
+            data = await resp.read()
+            if not data:
+                raise RuntimeError("empty body")
+            return data
+
+    async def _extract_images_with_fallback(self, data: dict) -> list[bytes]:
+        images = self._extract_images(data)
+        if images:
+            return images
+
+        texts = self._collect_text_parts(data)
+        text_b64_images = self._extract_data_uri_images_from_texts(texts)
+        if text_b64_images:
+            logger.info(
+                "[Gemini] inlineData missing, recovered %s image(s) from text data-uri",
+                len(text_b64_images),
+            )
+            return text_b64_images
+
+        url_candidates = self._extract_image_urls_from_texts(texts)
+        payload_urls = self._extract_image_urls_from_payload(data)
+        if payload_urls:
+            url_candidates.extend([u for u in payload_urls if u not in url_candidates])
+
+        downloaded: list[bytes] = []
+        for idx, url in enumerate(url_candidates[:3], start=1):
+            try:
+                img_bytes = await self._download_image_bytes(url)
+                downloaded.append(img_bytes)
+                logger.info(
+                    "[Gemini] inlineData missing, recovered image from url #%s: %s",
+                    idx,
+                    url[:120],
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Gemini] fallback url image download failed #%s: %s (%s)",
+                    idx,
+                    url[:120],
+                    e,
+                )
+        return downloaded
+
+    async def _request(
+        self,
+        parts: list[dict],
+        *,
+        resolution: str | None = None,
+        aspect_ratio: str | None = None,
+    ) -> dict:
+        """Send a Gemini native request with bounded transport retries.
+
+        Args:
+            parts: Gemini content parts for the user message.
+            resolution: Optional image resolution override.
+            aspect_ratio: Optional image aspect ratio override.
+
+        Returns:
+            Parsed Gemini response payload.
+
+        Raises:
+            RuntimeError: The request fails or Gemini returns an error payload.
+        """
+        url = self._build_url()
+        image_size = str(resolution or self.resolution or "4K").strip() or "4K"
+
+        image_config = {"imageSize": image_size}
+        if aspect_ratio:
+            image_config["aspectRatio"] = str(aspect_ratio).strip()
+
+        payload = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "maxOutputTokens": 8192,
+                "responseModalities": ["TEXT", "IMAGE"],
+                "imageConfig": image_config,
+            },
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {
+                    "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "threshold": "BLOCK_NONE",
+                },
+                {
+                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "threshold": "BLOCK_NONE",
+                },
+            ],
+        }
+
+        payload = merge_request_body(payload, self.extra_body)
+        proxy = self._proxy()
+        if proxy:
+            logger.debug(f"[Gemini] 使用代理: {proxy}")
+
+        session = await self._get_session()
+        for attempt in range(self.max_retries + 1):
+            api_key = await self._next_key()
+            headers = {
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            }
+            retry_error: RuntimeError | None = None
+
+            try:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    proxy=proxy,
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        error = RuntimeError(
+                            f"Gemini API 错误 ({resp.status}): {error_text[:200]}"
+                        )
+                        retryable = resp.status in {408, 409, 425, 429} or (
+                            500 <= resp.status < 600
+                        )
+                        if not retryable or attempt >= self.max_retries:
+                            logger.error(
+                                "[Gemini] API error (%s): %s",
+                                resp.status,
+                                error_text[:500],
+                            )
+                            raise error
+                        retry_error = error
+                    else:
+                        data = await resp.json()
+                        if "error" not in data:
+                            return data
+
+                        error_msg = data["error"]
+                        error = RuntimeError(f"Gemini API 错误: {error_msg}")
+                        raw_code = (
+                            error_msg.get("code")
+                            if isinstance(error_msg, dict)
+                            else None
+                        )
+                        try:
+                            error_code = int(raw_code)
+                        except (TypeError, ValueError):
+                            error_code = 0
+                        retryable = error_code in {408, 409, 425, 429} or (
+                            500 <= error_code < 600
+                        )
+                        if not retryable or attempt >= self.max_retries:
+                            logger.error("[Gemini] API payload error: %s", error_msg)
+                            raise error
+                        retry_error = error
+            except asyncio.TimeoutError as exc:
+                retry_error = RuntimeError("Gemini 请求超时")
+                if attempt >= self.max_retries:
+                    logger.error(
+                        "[Gemini] Request timed out (total=%ss, sock_connect=30s): %s",
+                        self.timeout,
+                        exc,
+                    )
+                    raise retry_error
+            except aiohttp.ClientError as exc:
+                retry_error = RuntimeError(f"Gemini 网络错误: {exc}")
+                if attempt >= self.max_retries:
+                    logger.error("[Gemini] Network error: %s", exc)
+                    raise retry_error
+
+            if retry_error is not None:
+                delay = min(2**attempt, 8)
+                logger.warning(
+                    "[Gemini] Request failed, retrying %s/%s in %ss: %s",
+                    attempt + 1,
+                    self.max_retries,
+                    delay,
+                    retry_error,
+                )
+                await asyncio.sleep(delay)
+
+        raise RuntimeError("Gemini 请求失败")
+
+    @staticmethod
+    def _extract_images(data: dict) -> list[bytes]:
+        all_images: list[bytes] = []
+        for candidate in data.get("candidates", []):
+            content = candidate.get("content", {})
+            if not isinstance(content, dict):
+                continue
+            for part in content.get("parts", []):
+                if not isinstance(part, dict):
+                    continue
+                # 兼容不同网关返回风格：inlineData / inline_data
+                inline_data = part.get("inlineData") or part.get("inline_data")
+                if not isinstance(inline_data, dict):
+                    continue
+                b64_data = inline_data.get("data")
+                if not isinstance(b64_data, str) or not b64_data.strip():
+                    continue
+                try:
+                    all_images.append(base64.b64decode(b64_data))
+                except Exception as e:
+                    logger.warning(f"[Gemini] inlineData 解码失败，已跳过: {e}")
+        return all_images
+
+    @staticmethod
+    def _build_no_image_reason(data: dict) -> str:
+        """提取 Gemini 未返回图片时的诊断信息。"""
+        parts: list[str] = []
+
+        model_version = str(
+            data.get("modelVersion") or data.get("model_version") or ""
+        ).strip()
+        if model_version:
+            parts.append(f"modelVersion={model_version}")
+
+        prompt_feedback = data.get("promptFeedback") or data.get("prompt_feedback")
+        if isinstance(prompt_feedback, dict):
+            block_reason = str(prompt_feedback.get("blockReason") or "").strip()
+            if block_reason:
+                parts.append(f"blockReason={block_reason}")
+
+            block_msg = str(
+                prompt_feedback.get("blockReasonMessage")
+                or prompt_feedback.get("block_reason_message")
+                or ""
+            ).strip()
+            if block_msg:
+                block_msg_preview = block_msg.replace("\n", " ")[:160]
+                parts.append(f"blockReasonMessage={block_msg_preview}")
+
+        finish_reasons: list[str] = []
+        finish_messages: list[str] = []
+        text_parts: list[str] = []
+        for candidate in data.get("candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            finish_reason = str(
+                candidate.get("finishReason") or candidate.get("finish_reason") or ""
+            ).strip()
+            if finish_reason:
+                finish_reasons.append(finish_reason)
+
+            finish_message = str(
+                candidate.get("finishMessage") or candidate.get("finish_message") or ""
+            ).strip()
+            if finish_message:
+                finish_messages.append(finish_message.replace("\n", " ")[:200])
+
+            content = candidate.get("content")
+            if not isinstance(content, dict):
+                continue
+            for part in content.get("parts", []):
+                if not isinstance(part, dict):
+                    continue
+                txt = part.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    text_parts.append(txt.strip())
+
+        if finish_reasons:
+            dedup = []
+            for x in finish_reasons:
+                if x not in dedup:
+                    dedup.append(x)
+            parts.append(f"finishReason={','.join(dedup)}")
+
+        if finish_messages:
+            dedup = []
+            for x in finish_messages:
+                if x not in dedup:
+                    dedup.append(x)
+            parts.append(f"finishMessage={dedup[0]}")
+
+        if text_parts:
+            snippet = text_parts[0].replace("\n", " ")[:120]
+            parts.append(f"text={snippet}")
+
+        return "; ".join(parts)
+
+    def resolve_output_intent(self, intent: OutputIntent) -> dict[str, str]:
+        if intent.exact_size:
+            return {
+                "aspect_ratio": aspect_ratio_from_size(intent.exact_size) or "",
+                "resolution": resolution_from_size(intent.exact_size) or "",
+            }
+        return {
+            "aspect_ratio": intent.aspect_ratio or "",
+            "resolution": intent.resolution or "",
+        }
+
+    async def generate(
+        self,
+        prompt: str,
+        *,
+        resolution: str | None = None,
+        aspect_ratio: str | None = None,
+        **_,
+    ) -> Path:
+        t_start = time.perf_counter()
+        parts = [
+            {
+                "text": (
+                    f"Generate a high quality {resolution or self.resolution} resolution image. "
+                    f"Follow this instruction: {prompt}. "
+                    "Output the image directly."
+                )
+            }
+        ]
+        data = await self._request(
+            parts,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+        )
+        all_images = await self._extract_images_with_fallback(data)
+        if not all_images:
+            reason = self._build_no_image_reason(data)
+            preview = str(data).replace("\n", " ")[:500]
+            logger.warning("[Gemini] no image in response: %s", preview)
+            if reason:
+                raise RuntimeError(f"Gemini 未返回图片（{reason}）")
+            raise RuntimeError("Gemini 未返回图片")
+
+        result_bytes = all_images[-1]
+        result_path = await self.imgr.save_image(
+            result_bytes, output_format=self.output_format
+        )
+        t_end = time.perf_counter()
+        logger.info(f"[Gemini] 生图完成: 耗时={t_end - t_start:.2f}s")
+        return result_path
+
+    async def close(self) -> None:
+        """清理资源"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """获取或创建 HTTP Session (线程安全)"""
+        if self._session is None or self._session.closed:
+            async with self._session_lock:
+                # Double-check pattern
+                if self._session is None or self._session.closed:
+                    connector = aiohttp.TCPConnector(
+                        limit=30,
+                        limit_per_host=30,
+                        ttl_dns_cache=300,
+                        enable_cleanup_closed=True,
+                    )
+                    timeout = aiohttp.ClientTimeout(
+                        total=self.timeout,
+                        sock_connect=30,
+                        sock_read=self.timeout,
+                    )
+                    self._session = aiohttp.ClientSession(
+                        connector=connector,
+                        timeout=timeout,
+                    )
+        return self._session
+
+    async def _next_key(self) -> str:
+        """轮询获取下一个 API Key"""
+        async with self._key_lock:
+            if not self.api_keys:
+                raise RuntimeError("Gemini API Key 未配置")
+            key = self.api_keys[self._key_index]
+            self._key_index = (self._key_index + 1) % len(self.api_keys)
+            return key
+
+    async def edit(
+        self,
+        prompt: str,
+        images: list[bytes],
+        *,
+        size: str | None = None,
+        resolution: str | None = None,
+        aspect_ratio: str | None = None,
+        **_,
+    ) -> Path:
+        """
+        执行改图
+
+        Args:
+            prompt: 提示词
+            images: 图片字节列表
+
+        Returns:
+            生成图片的本地路径
+        """
+        if not images:
+            raise ValueError("至少需要一张图片")
+        t_start = time.perf_counter()
+
+        final_resolution = (
+            str(
+                resolution or self._size_to_resolution(size) or self.resolution or "4K"
+            ).strip()
+            or "4K"
+        )
+        logger.info(
+            f"[Gemini] 开始改图: model={self.model}, "
+            f"resolution={final_resolution}, images={len(images)}"
+        )
+
+        final_prompt = (
+            f"Follow the requested edit or composition using the attached reference images in their numbered order: {prompt}. "
+            f"Generate a high quality {final_resolution} resolution image. "
+            f"Output the transformed image directly."
+        )
+
+        parts: list[dict] = [{"text": final_prompt}]
+        for index, img_bytes in enumerate(images, start=1):
+            parts.append({"text": f"Reference image {index} (参考图 {index}):"})
+            mime, _ = guess_image_mime_and_ext(img_bytes)
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": base64.b64encode(img_bytes).decode(),
+                    }
+                }
+            )
+
+        data = await self._request(
+            parts,
+            resolution=final_resolution,
+            aspect_ratio=aspect_ratio or aspect_ratio_from_size(size),
+        )
+        try:
+            all_images = await self._extract_images_with_fallback(data)
+        except Exception as e:
+            logger.error(f"[Gemini] 解析响应失败: {e}")
+            raise RuntimeError(f"Gemini 响应解析失败: {e}")
+
+        if not all_images:
+            reason = self._build_no_image_reason(data)
+            preview = str(data).replace("\n", " ")[:500]
+            logger.warning("[Gemini] no image in response: %s", preview)
+            if reason:
+                raise RuntimeError(f"Gemini 未返回图片（{reason}）")
+            raise RuntimeError("Gemini 未返回图片")
+
+        # 取最后一张图（第一张可能是低分辨率预览）
+        result_bytes = all_images[-1]
+        logger.info(
+            f"[Gemini] 收到 {len(all_images)} 张图片, "
+            f"使用最后一张 ({len(result_bytes)} bytes)"
+        )
+
+        # 保存图片
+        t_save = time.perf_counter()
+        result_path = await self.imgr.save_image(
+            result_bytes, output_format=self.output_format
+        )
+        t_end = time.perf_counter()
+
+        logger.info(
+            f"[Gemini] 改图完成: 总耗时={t_end - t_start:.2f}s, 保存={t_end - t_save:.2f}s"
+        )
+
+        return result_path

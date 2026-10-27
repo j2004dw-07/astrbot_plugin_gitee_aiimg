@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="astrbot_plugin_gitee_aiimg">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/astrbot_plugin_gitee_aiimg.zip!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

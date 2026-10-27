@@ -1,0 +1,305 @@
+# 服务商申请与配置
+
+[返回插件首页](../README.md) · [原生配置截图教程](quickstart.md) · [出图展示](../README.md#出图展示) · [完整参数参考](configuration.md)
+
+## 先分清两件事
+
+**服务商 `providers` 定义“接哪一个模型”, 功能链路 `features.*.chain` 定义“哪项功能使用它”.** 只填 Key 而不加入链路, 不会成为该功能的默认服务商.
+
+1. 打开 AstrBot **插件管理 → 本插件 → 配置**, 在底部 **模型服务商** 添加模板, 填写 ID、地址、Key 和模型.
+2. 到上方对应模式的 **服务商链路** 添加 `Provider`, 填写相同的服务商 ID. 第一个主用, 后续备用.
+3. 点击 **保存并关闭**, 再发一条对应指令测试. 临时指定服务商用 `@服务商ID`, 不会更改默认链路.
+
+[跟着美年达截图配置](quickstart.md). 需要获取模型下拉列表或拖动链路, 可使用 [映像工作台](studio.md#模型连接与回退链路).
+
+下方 JSON 是**插件配置片段**, 不是上游 API 请求体. 将 provider 追加到现有 `providers`, 将对应功能合并到 `features`; 不要整段覆盖已有模型、参考图或其它功能. 示例中的 `YOUR_..._API_KEY` 都是占位符.
+
+## Gitee AI
+
+**适用: 免费额度入门、纯文生图、最高 2K. 不适用: 改图、参考图自拍、多人物身份合成.**
+
+### 申请 API Key
+
+1. 打开 [Gitee AI 的 z-image-turbo 模型页](https://ai.gitee.com/serverless-api?model=z-image-turbo), 注册或登录账号.
+2. 选择 `z-image-turbo` 的体验/API 页面, 查看当前账号的每日免费额度和可用尺寸.
+3. 在 **API** 页选择访问令牌; 旧版界面可勾选“添加令牌为内嵌代码”, 在示例中的 `api_key` 位置取得令牌. 当前页面若改为独立的令牌管理入口, 按页面提示创建 Key.
+4. 只把自己的 Key 填入插件, 不公开示例中的真实令牌或带 Key 的截图.
+
+![Gitee 历史 API 页面: 选择 API 标签并取得访问令牌, 密钥已完全遮盖](assets/tutorials/gitee-api-key.png)
+
+旧版 README 的免费额度截图:
+
+![Gitee 历史免费额度: 每日免费体验 100 张](assets/tutorials/gitee-free-quota.png)
+
+截图来自 2025-12-05 的教程. 当前免费额度及适用尺寸以账号页面为准.
+
+### 配置 2K 文生图
+
+选择 **Gitee 图** 模板, 模型填写 `z-image-turbo`, Base URL 填写 `https://ai.gitee.com/v1`. 以下示例使用竖幅 `1536x2048`, `num_inference_steps=9`.
+
+```json
+{
+  "providers": [
+    {
+      "__template_key": "gitee_images",
+      "id": "gitee_zimage",
+      "label": "Gitee Z-Image-Turbo",
+      "base_url": "https://ai.gitee.com/v1",
+      "api_keys": ["YOUR_GITEE_API_KEY"],
+      "model": "z-image-turbo",
+      "default_size": "1536x2048",
+      "num_inference_steps": 9,
+      "timeout": 600,
+      "max_retries": 2,
+      "output_format": "jpeg",
+      "extra_body": {}
+    }
+  ],
+  "features": {
+    "draw": {
+      "enabled": true,
+      "llm_tool_enabled": true,
+      "chain": [
+        {
+          "__template_key": "provider",
+          "provider_id": "gitee_zimage",
+          "output": "1536x2048"
+        }
+      ]
+    }
+  }
+}
+```
+
+测试指令:
+
+```text
+/aiimg @gitee_zimage 一位成年女性站在窗边, 自然日光, 真实摄影 3:4
+```
+
+可用尺寸见 [Gitee 尺寸表](configuration.md#gitee-支持的图像尺寸). `z-image-turbo` 只加入 **文生图链路**, 不加入改图或自拍链路.
+
+### Gitee 文字伪自拍
+
+只配置 Gitee `z-image-turbo` 时, 关闭参考图自拍开关, 避免 LLM 为纯文生图模型调用自拍编辑流程. 已配置其它改图服务商的用户, 不需要把整个插件的自拍功能关闭, 只需确保自拍链路不包含这个模型.
+
+```json
+{
+  "features": {
+    "selfie": {
+      "enabled": false,
+      "llm_tool_enabled": false
+    }
+  }
+}
+```
+
+在人设中保存明确的成年人物外貌描述, 并约定请求照片时使用文生图模式, 例如:
+
+```text
+你的视觉形象是一位 26 岁成年女性, 黑色及肩短发, 棕色眼睛,
+鹅蛋脸, 自然肤质, 身材匀称. 每次生成自己的照片时,
+将这些外貌特征完整加入图片提示词, 再补上本次的服装、动作和场景.
+当前服务商只支持文字生成, 调用 aiimg_generate 时使用 mode=text,
+backend=gitee_zimage, 不使用自拍参考图或图像编辑模式.
+```
+
+文字伪自拍不能锁定同一张脸. 需要参考图自拍、合影或自拍视频时, 使用支持改图的模型, 如美年达香蕉.
+
+[查看 Gitee 出图](../README.md#gitee-z-image-turbo-文生图)
+
+## 美年达
+
+[注册美年达](https://meinianda.top/sign-up?aff=Qs4O) · [公开模型与价格页](https://meinianda.top/pricing) · [查看本插件自拍成片](../README.md#美年达-gemini-自拍)
+
+注册链接带作者 AFF 标识. 香蕉系列推荐用于真人写实, GPT Image 系列推荐用于二次元与插画; 价格以站点计费页为准.
+
+### 申请令牌与选择分组
+
+1. 注册并登录美年达, 在令牌/API Key 管理中创建供插件使用的令牌.
+2. 选择包含目标模型的分组, 确认账号余额、模型权限和模型限制. 不同分组的价格与可用模型可能不同.
+3. 将 Key 填入插件配置的 **API Key 池**, **模型名称** 按当前分组页面填写精确模型 ID.
+4. 香蕉和 GPT Image 分别创建服务商连接, 不把一个连接的协议随模型名称一起混用.
+
+以下提供两套配置. 修改服务商 ID 后, 同步更新链路引用.
+
+### 美年达香蕉配置
+
+选择 **Gemini 原生** 模板, 使用 `generateContent` 协议. 示例模型为 `gemini-3.1-flash-image`, 与首页展示的作者自拍所用模型一致.
+
+```json
+{
+  "__template_key": "gemini_native",
+  "id": "meinianda_banana",
+  "label": "美年达香蕉",
+  "api_url": "https://meinianda.top",
+  "api_keys": ["YOUR_MEINIANDA_API_KEY"],
+  "model": "gemini-3.1-flash-image",
+  "default_resolution": "4K",
+  "timeout": 600,
+  "max_retries": 2,
+  "use_proxy": false,
+  "proxy_url": "",
+  "output_format": "webp_lossless",
+  "extra_body": {}
+}
+```
+
+画幅和分辨率通过 Gemini 原生参数传递. `webp_lossless` 使用无损编码保存图片.
+
+### 美年达 GPT Image 配置
+
+美年达 **GPT Image 全系列统一使用 OpenAI Images 模板 (`openai_images`)**, 包括 `gpt-image-2`、2.5 flare、2.5 sunburst 及其 `-1K` 型号.
+
+下面以 `gpt-image-2` 为例; 使用其他型号时, 替换 `model` 即可:
+
+```json
+{
+  "__template_key": "openai_images",
+  "id": "meinianda_gpt_image",
+  "label": "美年达 GPT Image",
+  "base_url": "https://meinianda.top/v1",
+  "api_keys": ["YOUR_MEINIANDA_API_KEY"],
+  "model": "gpt-image-2",
+  "supports_edit": true,
+  "timeout": 600,
+  "max_retries": 0,
+  "default_size": "",
+  "output_format": "webp_lossless",
+  "extra_body": {}
+}
+```
+
+可选模型 ID: `gpt-image-2`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare-1K`、`gpt-image-2.5-sunburst-1K`. 按令牌分组选择可用型号, 并使用该型号支持的分辨率.
+
+质量参数写在额外请求体中, 如 `{"quality":"high"}`. 值为字符串, 只填写当前型号支持的档位.
+
+### 加入文生图与自拍链路
+
+先添加上面两个 provider, 再合并下面的功能片段. 此示例用 GPT Image 主作文生图, 香蕉主作改图与自拍. 链路顺序可在 WebUI 拖动调整.
+
+```json
+{
+  "features": {
+    "draw": {
+      "enabled": true,
+      "chain": [
+        {
+          "__template_key": "provider",
+          "provider_id": "meinianda_gpt_image",
+          "output": ""
+        },
+        {
+          "__template_key": "provider",
+          "provider_id": "meinianda_banana",
+          "output": ""
+        }
+      ]
+    },
+    "edit": {
+      "enabled": true,
+      "chain": [
+        {
+          "__template_key": "provider",
+          "provider_id": "meinianda_banana",
+          "output": ""
+        },
+        {
+          "__template_key": "provider",
+          "provider_id": "meinianda_gpt_image",
+          "output": ""
+        }
+      ]
+    },
+    "selfie": {
+      "enabled": true,
+      "llm_tool_enabled": true,
+      "default_aspect_ratio": "3:4",
+      "chain": [
+        {
+          "__template_key": "provider",
+          "provider_id": "meinianda_banana",
+          "output": "4K"
+        }
+      ],
+      "use_edit_chain_when_empty": true
+    }
+  }
+}
+```
+
+自拍还需要在 [形象库](studio.md#形象库与日程联动) 绑定 Bot 身份参考, 或用 [自拍参考指令](configuration.md#自拍参考照) 保存图片.
+
+```text
+/aiimg @meinianda_gpt_image 成年女性角色设定, 二次元插画, 干净背景
+/自拍 @meinianda_banana 在窗边看书, 自然光, 3:4
+```
+
+`use_edit_chain_when_empty=true` 会把改图链追加为自拍后备, 按 ID 去重; 只想使用自拍链路时设为 `false`.
+
+## Agnes AI（生图与视频）
+
+1. 在 [Agnes 平台](https://platform.agnes-ai.com/) 注册账号并创建 API Key, 确认当前限时免费活动与账号限流.
+2. **生图与改图 (`agnes_images`)**: 选择插件 **Agnes 图** 模板, API 地址填写 `https://apihub.agnes-ai.com/v1`, 模型推荐填写 `agnes-image-2.5-flash`（也支持 `agnes-image-2.1-flash`、`agnes-image-2.0-flash`）. 支持文生图、改图、自拍与多图顺序参考（最多 8 张, 单张小于 10 MB）, 输出档位支持 `1K`、`2K`、`3K`、`4K` 及 `1:1`、`3:4`、`4:3`、`16:9`、`9:16`、`2:3`、`3:2`、`21:9` 画幅.
+3. **视频生成 (`agnes_video`)**: 选择插件 **Agnes 视频** 模板, API 地址填写 `https://apihub.agnes-ai.com/v1`, 模型填写 `agnes-video-2.5-flash`. 加入视频链路并打开视频和 LLM 视频开关; `RPM=1` 时保持请求间隔至少 61 秒.
+
+### Agnes 生图配置示例
+
+```json
+{
+  "__template_key": "agnes_images",
+  "id": "agnes_image",
+  "label": "Agnes Image 2.5 Flash",
+  "base_url": "https://apihub.agnes-ai.com/v1",
+  "api_keys": ["YOUR_AGNES_API_KEY"],
+  "model": "agnes-image-2.5-flash",
+  "supports_edit": true,
+  "default_size": "2K",
+  "default_ratio": "1:1",
+  "timeout": 600,
+  "max_retries": 0,
+  "extra_body": {}
+}
+```
+
+将 `agnes_image` 加入 `features.draw.chain`、`features.edit.chain` 或 `features.selfie.chain` 即可使用文生图、改图和 Bot 自拍. 完整视频配置、参数限制与“先自拍再转视频”见 [Agnes 视频教程](video.md#agnes-注册与配置) 与 [先自拍再转视频](video.md#先自拍再转视频).
+
+## 其他接口
+
+本插件不绑定推荐站点. 可用的通用入口包括 OpenAI Images、Gemini 原生、Chat 出图、完整 URL、Gitee 异步改图、Flow2API 和其它已适配后端. 按 [接口模板速查](configuration.md#接口模板速查) 选择, 地址、模型和 Key 以自己的服务商为准.
+
+### 即梦配置
+
+即梦模板使用 Cookie 与 `conversation_id`, 不是 OpenAI Key. 在浏览器登录 [即梦 AI](https://jimeng.jianying.com/), 从会话地址取得 `conversation_id`, 从自己的网络请求中取得 Cookie. Cookie 会过期, 不要公开或共享.
+
+```json
+{
+  "__template_key": "jimeng",
+  "id": "jimeng_1",
+  "label": "即梦",
+  "cookie_list": ["YOUR_CONVERSATION_ID:YOUR_COOKIE"],
+  "timeout": 600
+}
+```
+
+### 云智配置
+
+[云智站点入口](https://ai.beimo.cc/register?aff=9FDGT62B49SM), 链接带 AFF 标识. 使用 OpenAI Images 模板:
+
+```json
+{
+  "__template_key": "openai_images",
+  "id": "yzcld_gpt_image_2",
+  "label": "云智 AI GPT Image",
+  "base_url": "https://www.yzcld.com",
+  "api_keys": ["YOUR_YUNZHI_API_KEY"],
+  "model": "gpt-image-2",
+  "supports_edit": true,
+  "timeout": 600,
+  "max_retries": 0,
+  "default_size": "",
+  "extra_body": {}
+}
+```
+
+添加后将 `yzcld_gpt_image_2` 加入需要的功能链路. 用自拍或合影前先确认该渠道的编辑及多图能力.

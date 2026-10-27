@@ -1,0 +1,7708 @@
+"""
+Gitee AI 图像生成插件
+
+功能:
+- 文生图 (z-image-turbo)
+- 图生图/改图 (Gemini / Gitee 千问，可切换)
+- Bot 自拍（参考照）：上传参考人像后用改图模型生成自拍
+- 视频生成 (Grok imagine, 参考图 + 提示词)
+- 预设提示词
+- 智能降级
+"""
+
+import asyncio
+import base64
+import copy
+import hashlib
+import inspect
+import io
+import json
+import math
+import random
+import re
+import time
+import uuid
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+
+import mcp
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import (
+    At,
+    AtAll,
+    File,
+    Image,
+    Plain,
+    Reply,
+    Video,
+)
+from astrbot.api.platform import MessageMember
+from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+
+from .core.background_tasks import (
+    ACTIVE_STATES,
+    TERMINAL_STATES,
+    BackgroundImageTaskManager,
+    BackgroundTaskCapacityError,
+    BackgroundTaskError,
+    BackgroundTaskOwnerError,
+    PreparedBatchJob,
+    PreparedImageJob,
+    TaskDeliveryTarget,
+)
+from .core.batch_executor import BatchRunResult, run_batch
+from .core.reference_subject import describe_reference_objects
+from .core.debouncer import Debouncer
+from .core.draw_service import ImageDrawService
+from .core.edit_router import EditRouter
+from .core.emoji_feedback import mark_failed, mark_processing, mark_success
+from .core.gitee_sizes import (
+    GITEE_SUPPORTED_RATIOS,
+    normalize_size_text,
+    resolve_ratio_size,
+)
+from .core.image_format import decode_base64_image_payload, guess_image_mime_and_ext
+from .core.image_manager import ImageManager
+from .core.image_reference_bridge import (
+    RECEIPT_KEY,
+    REFERENCE_KEY,
+    ReferenceSelection,
+    compose_inputs,
+    resolve_selection,
+    single_event_image_call,
+)
+from .core.image_task_parser import (
+    ImageTaskSpec,
+    ParsedImageRequest,
+    parse_image_request,
+)
+from .core.llm_batch_planner import (
+    PlannedPromptItem,
+    build_batch_planning_prompt,
+    parse_planned_prompt_items,
+    validate_planned_prompt_items,
+)
+from .core.nanobanana import NanoBananaService
+from .core.output_spec import (
+    OutputIntent,
+    aspect_ratio_from_size,
+    format_output_intent,
+    merge_output_intents,
+    normalize_aspect_ratio,
+    parse_output_intent,
+    resolve_llm_output_intent,
+    split_prompt_output_suffix,
+)
+from .core.provider_registry import ProviderRegistry
+from .core.ref_store import ReferenceStore
+from .core.utils import close_session, collect_at_user_ids, get_images_from_event
+
+try:
+    from .core.utils import get_raw_images_from_event
+except ImportError:  # Older test/runtime stubs may not expose the optional fallback.
+    get_raw_images_from_event = None
+from .core.video_manager import VideoManager
+
+try:
+    from astrbot.core.agent.message import TextPart
+except ImportError:
+    TextPart = None
+
+_async_pause = asyncio.sleep
+
+
+class ImageCommandWakePrefixFilter(filter.CustomFilter):
+    """Require AstrBot's real wake behavior for regex-based plugin commands."""
+
+    @staticmethod
+    def _wake_prefixes(cfg: object) -> tuple[str, ...]:
+        try:
+            raw = cfg.get("wake_prefix", ["/"])
+        except Exception:
+            raw = ["/"]
+        if isinstance(raw, str):
+            return (raw,) if raw else ("/",)
+        if isinstance(raw, (list, tuple, set)):
+            return tuple(str(item) for item in raw if str(item)) or ("/",)
+        return ("/",)
+
+    @staticmethod
+    def _is_private_chat(event: AstrMessageEvent) -> bool:
+        try:
+            return bool(event.is_private_chat())
+        except Exception:
+            message_obj = getattr(event, "message_obj", None)
+            return not bool(getattr(message_obj, "group", None))
+
+    @staticmethod
+    def _plain_has_configured_prefix(text: str, prefixes: tuple[str, ...]) -> bool:
+        """Check whether a raw text segment starts with a configured prefix.
+
+        Args:
+            text: Raw plain-text segment from the platform message chain.
+            prefixes: Wake prefixes from AstrBot's active configuration.
+
+        Returns:
+            Whether the segment begins with a non-empty prefixed token.
+        """
+        plain = str(text or "").lstrip()
+        for prefix in prefixes:
+            if not plain.startswith(prefix):
+                continue
+            end = len(prefix)
+            if end < len(plain) and not plain[end].isspace():
+                return True
+        return False
+
+    def filter(self, event: AstrMessageEvent, cfg: object) -> bool:
+        """Apply wake-prefix gating before a regex handler can wake the event.
+
+        Args:
+            event: Current AstrBot message event.
+            cfg: Active AstrBot base configuration.
+
+        Returns:
+            Whether the event is allowed to reach the plugin handler.
+        """
+        if self._is_private_chat(event):
+            return bool(getattr(event, "is_at_or_wake_command", False))
+        prefixes = self._wake_prefixes(cfg)
+        try:
+            chain = event.get_messages()
+        except Exception:
+            chain = []
+        return any(
+            isinstance(seg, Plain)
+            and self._plain_has_configured_prefix(
+                str(getattr(seg, "text", "") or ""),
+                prefixes,
+            )
+            for seg in chain or []
+        )
+
+
+@dataclass(slots=True)
+class SendImageResult:
+    ok: bool
+    reason: str = ""
+    cached_path: Path | None = None
+    used_fallback: bool = False
+    last_error: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+@dataclass(slots=True)
+class ExecutedImageTask:
+    spec: ImageTaskSpec
+    image_path: Path
+    task_meta: dict[str, Any]
+
+
+class GiteeAIImagePlugin(Star):
+    """Gitee AI 图像生成插件"""
+
+    # Gitee AI 支持的图片比例
+    SUPPORTED_RATIOS: dict[str, list[str]] = GITEE_SUPPORTED_RATIOS
+    IMAGE_AS_FILE_THRESHOLD_BYTES: int = 20 * 1024 * 1024
+    WEIXIN_SEND_TEMP_PATTERN: str = "weixin_send_*.jpg"
+    WEIXIN_SEND_TEMP_MAX_FILES: int = 64
+    WEIXIN_SEND_TEMP_TTL_SECONDS: int = 24 * 60 * 60
+
+    def __init__(self, context: Context, config: dict):
+        super().__init__(context)
+        self.config = config
+        self.data_dir = StarTools.get_data_dir("astrbot_plugin_gitee_aiimg")
+        self._last_image_by_user: dict[str, Path] = {}
+        self._last_image_task_meta_cache: dict[str, dict[str, Any]] = {}
+        self.background_tasks: BackgroundImageTaskManager | None = None
+        self._background_recovery_records: list[dict[str, Any]] = []
+        self._background_send_gates: dict[str, asyncio.Event] = {}
+        self._background_start_task: asyncio.Task[None] | None = None
+        self._background_astrbot_loaded = False
+        self.studio = None
+
+    async def _call_native_poke(self, event: AstrMessageEvent, target_id: str) -> bool:
+        bot = getattr(event, "bot", None)
+        if bot is None or not hasattr(bot, "call_action"):
+            return False
+
+        user_id: int | str = int(target_id) if target_id.isdigit() else target_id
+        try:
+            await bot.call_action("friend_poke", user_id=user_id)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[GiteeAIImagePlugin] friend_poke failed: target=%s err=%s",
+                target_id,
+                exc,
+            )
+
+        try:
+            await bot.call_action("send_poke", user_id=user_id)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[GiteeAIImagePlugin] send_poke failed: target=%s err=%s",
+                target_id,
+                exc,
+            )
+            return False
+
+    async def _signal_llm_tool_failure(self, event: AstrMessageEvent) -> None:
+        if event.is_private_chat():
+            target_id = str(event.get_sender_id() or "").strip()
+            if target_id:
+                if await self._call_native_poke(event, target_id):
+                    return
+        await mark_failed(event)
+
+    @staticmethod
+    def _llm_tool_text_result(message: str) -> mcp.types.CallToolResult:
+        text = str(message or "").strip()
+        if not text:
+            text = "The tool completed without additional details."
+        return mcp.types.CallToolResult(
+            content=[mcp.types.TextContent(type="text", text=text)]
+        )
+
+    @staticmethod
+    def _summarize_status_text(
+        value: Exception | str | None,
+        *,
+        fallback: str,
+        limit: int = 180,
+    ) -> str:
+        text = " ".join(str(value or "").split())
+        if not text:
+            return fallback
+        if len(text) <= limit:
+            return text
+        return f"{text[: limit - 3].rstrip()}..."
+
+    @staticmethod
+    def _truncate_text(value: Any, *, limit: int = 320) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return f"{text[: limit - 3].rstrip()}..."
+
+    @staticmethod
+    def _get_event_conversation_id(event: AstrMessageEvent) -> str:
+        provider_request = event.get_extra("provider_request")
+        conversation = getattr(provider_request, "conversation", None)
+        return str(getattr(conversation, "cid", "") or "").strip()
+
+    @staticmethod
+    def _get_event_self_id(event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_self_id() or "").strip()
+        except Exception:
+            return ""
+
+    def _image_task_store_key(
+        self,
+        event: AstrMessageEvent,
+        *,
+        conversation_id: str = "",
+    ) -> str:
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip() or "unknown"
+        self_id = self._get_event_self_id(event) or "unknown_bot"
+        sender_id = str(event.get_sender_id() or "").strip() or "unknown"
+        conversation_scope = (
+            str(conversation_id or "").strip()
+            or self._get_event_conversation_id(event)
+            or "default"
+        )
+        return f"last_image_task::{umo}::{self_id}::{sender_id}::{conversation_scope}"
+
+    async def _resolve_image_task_store_key(self, event: AstrMessageEvent) -> str:
+        conversation_id = self._get_event_conversation_id(event)
+        if not conversation_id:
+            conversation = await self._resolve_plugin_conversation(event)
+            conversation_id = str(getattr(conversation, "cid", "") or "").strip()
+        return self._image_task_store_key(event, conversation_id=conversation_id)
+
+    @staticmethod
+    def _normalize_image_task_meta(meta: Any) -> dict[str, Any] | None:
+        if not isinstance(meta, dict):
+            return None
+        mode = str(meta.get("mode") or "").strip()
+        if not mode:
+            return None
+        try:
+            reference_count = int(meta.get("reference_count") or 0)
+            extra_reference_count = int(meta.get("extra_reference_count") or 0)
+            created_at = float(meta.get("created_at") or time.time())
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning(
+                "[GiteeAIImagePlugin] discard malformed last-image-task meta: %s",
+                exc,
+            )
+            return None
+        if (
+            reference_count < 0
+            or extra_reference_count < 0
+            or not math.isfinite(created_at)
+            or created_at < 0
+        ):
+            logger.warning(
+                "[GiteeAIImagePlugin] discard invalid last-image-task meta values: %s",
+                meta,
+            )
+            return None
+        normalized = {
+            "mode": mode,
+            "result_image_id": str(meta.get("result_image_id") or ""),
+            "result_registration": str(meta.get("result_registration") or ""),
+            "reference_sources": meta.get("reference_sources", [])
+            if isinstance(meta.get("reference_sources", []), list)
+            else [],
+            "user_prompt": str(meta.get("user_prompt") or "").strip(),
+            "effective_user_prompt": str(
+                meta.get("effective_user_prompt") or ""
+            ).strip(),
+            "effective_prompt": str(meta.get("effective_prompt") or "").strip(),
+            "reference_source": str(meta.get("reference_source") or "").strip(),
+            "reference_count": reference_count,
+            "extra_reference_count": extra_reference_count,
+            "continue_with": str(meta.get("continue_with") or mode).strip() or mode,
+            "follow_up": bool(meta.get("follow_up", False)),
+            "backend": str(meta.get("backend") or "").strip(),
+            "created_at": created_at,
+        }
+        return normalized
+
+    async def _save_last_image_task_meta(
+        self, event: AstrMessageEvent, meta: dict[str, Any]
+    ) -> None:
+        normalized = self._normalize_image_task_meta(meta)
+        if normalized is None:
+            return
+
+        store_key = await self._resolve_image_task_store_key(event)
+        self._last_image_task_meta_cache[store_key] = normalized
+
+        try:
+            await self.put_kv_data(store_key, normalized)
+        except Exception as exc:
+            logger.debug(
+                "[GiteeAIImagePlugin] skip persistent last-image-task save: %s",
+                exc,
+            )
+
+    async def _load_last_image_task_meta(
+        self, event: AstrMessageEvent
+    ) -> dict[str, Any] | None:
+        store_key = await self._resolve_image_task_store_key(event)
+        cached_raw = self._last_image_task_meta_cache.get(store_key)
+        cached = self._normalize_image_task_meta(cached_raw)
+        if cached is not None:
+            return cached
+        if cached_raw is not None:
+            self._last_image_task_meta_cache.pop(store_key, None)
+
+        try:
+            stored = await self.get_kv_data(store_key, None)
+        except Exception as exc:
+            logger.debug(
+                "[GiteeAIImagePlugin] skip persistent last-image-task load: %s",
+                exc,
+            )
+            return None
+
+        normalized = self._normalize_image_task_meta(stored)
+        if normalized is not None:
+            self._last_image_task_meta_cache[store_key] = normalized
+            return normalized
+        if stored is not None:
+            try:
+                await self.delete_kv_data(store_key)
+            except Exception as exc:
+                logger.debug(
+                    "[GiteeAIImagePlugin] skip cleanup malformed last-image-task meta: %s",
+                    exc,
+                )
+        return None
+
+    @staticmethod
+    def _looks_like_image_follow_up(prompt: str) -> bool:
+        text = str(prompt or "").strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        keywords = (
+            "不满意",
+            "不太满意",
+            "重新",
+            "重来",
+            "再来",
+            "再拍",
+            "换个",
+            "换成",
+            "换一下",
+            "改一下",
+            "改改",
+            "调整",
+            "重拍",
+            "再生成",
+            "重新拍",
+            "重新来",
+            "pose",
+            "again",
+            "redo",
+            "adjust",
+            "change",
+        )
+        return any(keyword in text or keyword in lowered for keyword in keywords)
+
+    async def _match_selfie_follow_up(
+        self, event: AstrMessageEvent, prompt: str
+    ) -> dict[str, Any] | None:
+        if self._is_auto_selfie_prompt(prompt):
+            return None
+        if not self._looks_like_image_follow_up(prompt):
+            return None
+        if await self._has_message_images(event):
+            return None
+
+        last_meta = await self._load_last_image_task_meta(event)
+        if last_meta is None:
+            return None
+        if str(last_meta.get("continue_with") or "") != "selfie_ref":
+            return None
+
+        created_at = float(last_meta.get("created_at") or 0)
+        if created_at > 0 and time.time() - created_at > 1800:
+            return None
+
+        ref_paths, ref_source = await self._get_selfie_reference_paths(event)
+        if not ref_paths:
+            return None
+
+        meta = dict(last_meta)
+        meta["reference_source"] = ref_source
+        meta["reference_count"] = len(ref_paths)
+        return meta
+
+    def _build_selfie_follow_up_prompt(
+        self, prompt: str, last_meta: dict[str, Any] | None
+    ) -> str:
+        current_prompt = str(prompt or "").strip()
+        if last_meta is None:
+            return current_prompt
+
+        previous_prompt = (
+            str(last_meta.get("effective_user_prompt") or "").strip()
+            or str(last_meta.get("user_prompt") or "").strip()
+        )
+        if not previous_prompt:
+            return current_prompt
+        if not current_prompt:
+            return f"延续上一张自拍要求：{previous_prompt}"
+        return f"延续上一张自拍要求：{previous_prompt}；本次新增要求：{current_prompt}"
+
+    def _build_image_task_meta(
+        self,
+        *,
+        mode: str,
+        user_prompt: str,
+        effective_prompt: str,
+        effective_user_prompt: str | None = None,
+        reference_source: str = "",
+        reference_count: int = 0,
+        extra_reference_count: int = 0,
+        continue_with: str | None = None,
+        follow_up: bool = False,
+        backend: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "mode": str(mode or "").strip(),
+            "user_prompt": str(user_prompt or "").strip(),
+            "effective_user_prompt": str(
+                effective_user_prompt
+                if effective_user_prompt is not None
+                else user_prompt
+            ).strip(),
+            "effective_prompt": str(effective_prompt or "").strip(),
+            "reference_source": str(reference_source or "").strip(),
+            "reference_count": max(0, int(reference_count or 0)),
+            "extra_reference_count": max(0, int(extra_reference_count or 0)),
+            "continue_with": str(continue_with or mode or "").strip()
+            or str(mode or "").strip(),
+            "follow_up": bool(follow_up),
+            "backend": str(backend or "").strip(),
+            "created_at": time.time(),
+        }
+
+    def _build_image_task_completion_result(
+        self, task_meta: dict[str, Any]
+    ) -> mcp.types.CallToolResult:
+        mode = str(task_meta.get("mode") or "image").strip() or "image"
+        summary = {
+            "status": "completed",
+            "mode": mode,
+            "result_image_id": str(task_meta.get("result_image_id") or ""),
+            "reference_sources": task_meta.get("reference_sources", []),
+            "continue_with": str(task_meta.get("continue_with") or mode).strip()
+            or mode,
+            "user_prompt": self._truncate_text(task_meta.get("user_prompt"), limit=180),
+            "effective_prompt": self._truncate_text(
+                task_meta.get("effective_prompt"), limit=260
+            ),
+            "reference_source": str(task_meta.get("reference_source") or "").strip(),
+            "reference_count": int(task_meta.get("reference_count") or 0),
+            "extra_reference_count": int(task_meta.get("extra_reference_count") or 0),
+            "follow_up": bool(task_meta.get("follow_up", False)),
+        }
+        if task_meta.get("backend"):
+            summary["backend"] = str(task_meta.get("backend"))
+
+        hint = (
+            "For edits to this exact delivered image, use edit with result_image_id as subject. For a new selfie, use selfie_ref and explicitly reselect required extra references from the current catalog."
+            if summary["continue_with"] == "selfie_ref"
+            else "If the user asks for changes, continue from this completed image task instead of guessing a brand-new request."
+        )
+        return self._llm_tool_text_result(
+            "The image has already been generated and sent to the user. Do not send another confirmation message to the user. "
+            f"Store this task summary for follow-ups: {json.dumps(summary, ensure_ascii=False)} "
+            + hint
+        )
+
+    async def _resolve_plugin_conversation(self, event: AstrMessageEvent) -> Any | None:
+        provider_request = event.get_extra("provider_request")
+        conversation = getattr(provider_request, "conversation", None)
+        if conversation is not None:
+            return conversation
+
+        conv_mgr = getattr(self.context, "conversation_manager", None)
+        if conv_mgr is None:
+            return None
+
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not umo:
+            return None
+
+        try:
+            conversation_id = await conv_mgr.get_curr_conversation_id(umo)
+            if not conversation_id:
+                return None
+            conversation = await conv_mgr.get_conversation(umo, conversation_id)
+        except Exception as exc:
+            logger.warning(
+                "[GiteeAIImagePlugin] failed to resolve conversation for plugin note: %s",
+                exc,
+            )
+            return None
+
+        if conversation is not None and provider_request is not None:
+            try:
+                provider_request.conversation = conversation
+            except Exception:
+                pass
+        return conversation
+
+    async def _append_plugin_conversation_note(
+        self, event: AstrMessageEvent, note: str
+    ) -> None:
+        note = str(note or "").strip()
+        if not note:
+            return
+
+        conv_mgr = getattr(self.context, "conversation_manager", None)
+        if conv_mgr is None:
+            return
+
+        conversation = await self._resolve_plugin_conversation(event)
+        if conversation is None:
+            return
+
+        history_raw = getattr(conversation, "history", "[]")
+        if isinstance(history_raw, list):
+            history = list(history_raw)
+        else:
+            try:
+                parsed_history = json.loads(history_raw or "[]")
+                history = (
+                    list(parsed_history) if isinstance(parsed_history, list) else []
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[GiteeAIImagePlugin] failed to parse conversation history for plugin note: %s",
+                    exc,
+                )
+                history = []
+
+        history.append(
+            {"role": "user", "content": "Output your last task result below."}
+        )
+        history.append({"role": "assistant", "content": note})
+
+        try:
+            await conv_mgr.update_conversation(
+                event.unified_msg_origin,
+                getattr(conversation, "cid", None),
+                history=history,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[GiteeAIImagePlugin] failed to persist plugin conversation note: %s",
+                exc,
+            )
+            return
+
+        try:
+            conversation.history = json.dumps(history, ensure_ascii=False)
+        except Exception:
+            pass
+
+    async def initialize(self):
+        self.debouncer = Debouncer(self.config)
+        self.imgr = ImageManager(self.config, self.data_dir)
+        self.registry = ProviderRegistry(
+            self.config, imgr=self.imgr, data_dir=self.data_dir
+        )
+        for err in self.registry.validate():
+            logger.warning("[GiteeAIImagePlugin][config] %s", err)
+
+        self.draw = ImageDrawService(
+            self.config, self.imgr, self.data_dir, registry=self.registry
+        )
+        self.edit = EditRouter(
+            self.config, self.imgr, self.data_dir, registry=self.registry
+        )
+        self.nb = NanoBananaService(self.config, self.imgr)
+        self.refs = ReferenceStore(self.data_dir)
+        self.videomgr = VideoManager(self.config, self.data_dir)
+
+        self._concurrency_lock = asyncio.Lock()
+        self._image_inflight: dict[str, int] = {}
+        self._video_inflight: dict[str, int] = {}
+        self._video_tasks: set[asyncio.Task] = set()
+
+        background_conf = self._get_feature("background_llm_image")
+        background_enabled = self._as_bool(
+            background_conf.get("enabled", False), default=False
+        )
+        background_status = "disabled"
+        if background_enabled:
+            background_status = "starting"
+            manager = BackgroundImageTaskManager(
+                Path(self.data_dir),
+                max_running=self._as_int(
+                    background_conf.get("max_running", 2), default=2
+                ),
+                max_queued=self._as_int(
+                    background_conf.get("max_queued", 16), default=16
+                ),
+                log=logger,
+            )
+            try:
+                self._background_recovery_records = await manager.start()
+            except BackgroundTaskOwnerError as exc:
+                background_status = "waiting_for_owner"
+                logger.warning(
+                    "[background-image] previous owner lease is still live; "
+                    "background mode will retry without blocking AstrBot startup: %s",
+                    BackgroundImageTaskManager.sanitize_error(exc),
+                )
+
+                async def retry_background_start() -> None:
+                    """Acquire the durable owner after a crashed process lease expires."""
+
+                    attempts = 0
+                    while True:
+                        await asyncio.sleep(
+                            max(0.0, min(5.0, float(manager.heartbeat_seconds)))
+                        )
+                        try:
+                            recovered = await manager.start()
+                        except BackgroundTaskOwnerError:
+                            attempts += 1
+                            if attempts % 12 == 0:
+                                logger.warning(
+                                    "[background-image] still waiting for the previous owner lease: attempts=%s",
+                                    attempts,
+                                )
+                            continue
+                        except Exception as retry_exc:
+                            logger.error(
+                                "[background-image] disabled after owner retry failed: %s",
+                                BackgroundImageTaskManager.sanitize_error(retry_exc),
+                            )
+                            return
+
+                        self.background_tasks = manager
+                        logger.info(
+                            "[background-image] durable owner acquired after retry: "
+                            "attempts=%s recovered=%s",
+                            attempts + 1,
+                            len(recovered),
+                        )
+                        if self._background_astrbot_loaded:
+                            for record in recovered:
+                                await self._dispatch_background_completion(
+                                    manager,
+                                    record,
+                                    self._delivery_target_from_record(record),
+                                )
+                        else:
+                            self._background_recovery_records.extend(recovered)
+                        return
+
+                self._background_start_task = asyncio.create_task(
+                    retry_background_start(),
+                    name="background-image-owner-retry",
+                )
+            except Exception as exc:
+                background_status = "startup_failed"
+                logger.error(
+                    "[background-image] disabled after startup check failed: %s",
+                    BackgroundImageTaskManager.sanitize_error(exc),
+                )
+            else:
+                self.background_tasks = manager
+                background_status = "active"
+
+        # 读取 AstrBot 配置的唤醒前缀，用于限制命令匹配范围
+        try:
+            if hasattr(self.context, "get_config"):
+                base_config = self.context.get_config()
+            else:
+                base_config = getattr(self.context, "base_config", {})
+            raw = base_config.get("wake_prefix", ["/"])
+            if isinstance(raw, str):
+                self._wake_prefixes: tuple[str, ...] = (raw,) if raw else ("/",)
+            elif isinstance(raw, list):
+                self._wake_prefixes = tuple(str(p) for p in raw if p) or ("/",)
+            else:
+                self._wake_prefixes = ("/",)
+        except Exception:
+            self._wake_prefixes = ("/",)
+
+        self._patch_tool_image_cache_runtime()
+
+        # 动态注册预设命令 (方案C: /手办化 直接触发)
+        self._register_preset_commands()
+
+        if callable(getattr(self.context, "register_web_api", None)):
+            from .core.studio import Studio
+
+            self.studio = Studio(self)
+            await self.studio.start()
+
+        logger.info(
+            f"[GiteeAIImagePlugin] 插件初始化完成: "
+            f"改图后端={self.edit.get_available_backends()}, "
+            f"文生图预设={len(self._get_draw_presets())}个, "
+            f"改图预设={len(self.edit.get_preset_names())}个, "
+            f"视频启用={bool(self._get_feature('video').get('enabled', False))}, "
+            f"视频预设={len(self._get_video_presets())}个, "
+            f"LLM后台生图={background_status}"
+        )
+
+    @filter.on_astrbot_loaded()
+    async def on_background_astrbot_loaded(self) -> None:
+        """Drain restart recovery notifications after platforms are available."""
+
+        self._background_astrbot_loaded = True
+        manager = getattr(self, "background_tasks", None)
+        if manager is None:
+            return
+        records = list(self._background_recovery_records)
+        self._background_recovery_records.clear()
+        for record in records:
+            target = self._delivery_target_from_record(record)
+            await self._dispatch_background_completion(manager, record, target)
+
+    @staticmethod
+    def _background_task_context_summary(
+        record: dict[str, Any], now_ms: int
+    ) -> dict[str, Any]:
+        """Build a bounded, prompt-free summary for ordinary LLM turns."""
+
+        summary: dict[str, Any] = {}
+        for key in (
+            "task_id",
+            "task_kind",
+            "state",
+            "mode",
+            "image_generated",
+            "image_sent",
+            "delivery_state",
+            "requested_count",
+            "planned_count",
+            "generated_count",
+            "sent_count",
+            "failed_count",
+            "cancelled_count",
+            "unknown_count",
+        ):
+            value = record.get(key)
+            if value is not None and value != "":
+                summary[key] = value
+
+        requester = (
+            record.get("requester")
+            or record.get("sender_name")
+            or record.get("sender_id")
+        )
+        if requester:
+            summary["requester"] = str(requester)
+
+        created_at = record.get("created_at")
+        if created_at:
+            try:
+                summary["elapsed_seconds"] = max(
+                    0, (now_ms - int(float(created_at))) // 1000
+                )
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        items = record.get("items")
+        if isinstance(items, list):
+            summary["item_count"] = len(items)
+            states: dict[str, int] = {}
+            for item in items:
+                state = str(item.get("state") or "unknown")
+                states[state] = states.get(state, 0) + 1
+            summary["item_states"] = states
+
+        has_prompt = bool(record.get("user_prompt") or record.get("effective_prompt"))
+        if not has_prompt and isinstance(items, list):
+            has_prompt = any(
+                bool(item.get("user_prompt") or item.get("effective_prompt"))
+                for item in items
+            )
+        summary["prompt_available"] = has_prompt
+        if has_prompt:
+            summary["prompt_lookup"] = "aiimg_task_status"
+
+        error_message = str(record.get("error_message") or "").strip()
+        if error_message:
+            summary["error_message"] = BackgroundImageTaskManager.sanitize_error(
+                error_message, 180
+            )
+        return summary
+
+    @classmethod
+    def _background_task_context_block(cls, summaries: list[dict[str, Any]]) -> str:
+        """Serialize task facts without ever placing raw prompts in context."""
+
+        max_chars = 2400
+        suffix = (
+            "\nThese are authoritative live task facts. Use the recorded state and delivery counts. "
+            "Do not invent progress, prompts, or delivery results."
+        )
+        payload: dict[str, Any] = {
+            "schema_version": 2,
+            "tasks": summaries,
+            "prompt_details": "Use aiimg_task_status only when the user asks for task details.",
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        wrapper_len = len(
+            "<background_image_task_summary></background_image_task_summary>"
+        )
+        if len(serialized) + wrapper_len + len(suffix) > max_chars:
+            minimal = [
+                {
+                    key: summary[key]
+                    for key in (
+                        "task_id",
+                        "task_kind",
+                        "state",
+                        "mode",
+                        "delivery_state",
+                    )
+                    if key in summary
+                }
+                for summary in summaries
+            ]
+            payload = {
+                "schema_version": 2,
+                "tasks": minimal[:3],
+                "truncated": True,
+                "prompt_details": "Use aiimg_task_status only when the user asks for task details.",
+            }
+            serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        block = (
+            "<background_image_task_summary>"
+            + serialized
+            + "</background_image_task_summary>"
+            + suffix
+        )
+        if len(block) <= max_chars:
+            return block
+        return (
+            '<background_image_task_summary>{"schema_version":2,"tasks":[],"truncated":true,'
+            '"prompt_details":"Use aiimg_task_status only when the user asks for task details."}'
+            "</background_image_task_summary>" + suffix
+        )
+
+    @filter.on_llm_request(priority=-20)
+    async def inject_background_image_tasks(self, event: AstrMessageEvent, req) -> None:
+        """Inject bounded task state; detailed prompts stay behind the status tool.
+
+        Args:
+            event: Current pipeline event.
+            req: Mutable AstrBot provider request.
+        """
+
+        manager = getattr(self, "background_tasks", None)
+        if manager is None:
+            return
+        exact_task_id = str(event.get_extra("_gitee_bg_task_id", "") or "")
+        records: list[dict[str, Any]] = []
+        if exact_task_id:
+            record = await manager.get_task(exact_task_id)
+            if record is not None:
+                records.append(record)
+        else:
+            try:
+                umo = str(event.unified_msg_origin or "")
+                sender_id = str(event.get_sender_id() or "")
+                self_id = str(event.get_self_id() or "")
+            except Exception:
+                return
+            conversation = getattr(req, "conversation", None)
+            conversation_id = str(getattr(conversation, "cid", "") or "")
+            if not conversation_id:
+                conversation_manager = getattr(
+                    self.context, "conversation_manager", None
+                )
+                if conversation_manager is None:
+                    return
+                try:
+                    current_id = await conversation_manager.get_curr_conversation_id(
+                        umo
+                    )
+                    if not current_id:
+                        return
+                    conversation = await conversation_manager.get_conversation(
+                        umo,
+                        current_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[background-image] skipped task injection because the conversation could not be resolved: %s",
+                        BackgroundImageTaskManager.sanitize_error(exc),
+                    )
+                    return
+                if conversation is None:
+                    return
+                conversation_id = str(getattr(conversation, "cid", "") or current_id)
+                req.conversation = conversation
+            scope = manager.scope_hash(umo, self_id, sender_id, conversation_id)
+            own_records = await manager.list_scope_tasks(scope, limit=6)
+            now = manager.now_ms()
+            for record in own_records:
+                if record.get("state") in ACTIVE_STATES:
+                    records.append(record)
+                elif now - int(record.get("finished_at") or 0) <= 30 * 60 * 1000:
+                    records.append(record)
+                if len(records) >= 3:
+                    break
+
+            for record in await manager.list_active_for_umo(umo):
+                if str(record.get("sender_id") or "") == sender_id:
+                    continue
+                if str(record.get("self_id") or "") != self_id:
+                    continue
+                if str(record.get("conversation_id") or "") != conversation_id:
+                    continue
+                records.append(
+                    {
+                        "task_id": record.get("task_id"),
+                        "task_kind": record.get("task_kind"),
+                        "state": record.get("state"),
+                        "requester": record.get("sender_name")
+                        or record.get("sender_id"),
+                        "created_at": record.get("created_at"),
+                    }
+                )
+                if len(records) >= 3:
+                    break
+        if not records:
+            return
+
+        now = manager.now_ms()
+        summaries = [
+            self._background_task_context_summary(record, now) for record in records[:3]
+        ]
+        block = self._background_task_context_block(summaries)
+        extra_parts = getattr(req, "extra_user_content_parts", None)
+        if isinstance(extra_parts, list) and TextPart is not None:
+            extra_parts.append(TextPart(text=block).mark_as_temp())
+        else:
+            req.system_prompt = (
+                str(getattr(req, "system_prompt", "") or "") + "\n" + block
+            )
+
+        if exact_task_id:
+            tool_set = getattr(req, "func_tool", None)
+            if tool_set is not None and isinstance(
+                getattr(tool_set, "tools", None), list
+            ):
+                filtered = copy.copy(tool_set)
+                blocked = {
+                    "aiimg_generate",
+                    "gitee_draw_image",
+                    "gitee_edit_image",
+                    "aiimg_batch_generate",
+                    "send_message_to_user",
+                }
+                filtered.tools = [
+                    tool
+                    for tool in tool_set.tools
+                    if str(getattr(tool, "name", "") or "") not in blocked
+                ]
+                req.func_tool = filtered
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
+    async def handle_background_session_commands(self, event: AstrMessageEvent) -> None:
+        """Observe stop/reset/new without replacing AstrBot's command handlers.
+
+        Args:
+            event: Current platform event.
+        """
+
+        manager = getattr(self, "background_tasks", None)
+        if manager is None or event.get_extra("_gitee_bg_completion", False):
+            return
+        text = str(getattr(event, "message_str", "") or "").strip()
+        match = re.match(r"^[\s/!！.。．]*(stop|reset|new)(?:\s|$)", text, re.I)
+        if match is None:
+            return
+        command = match.group(1).lower()
+        if command == "stop":
+            cancelled = await self._cancel_background_scope_with_notifications(
+                manager,
+                umo=str(event.unified_msg_origin or ""),
+                sender_id=str(event.get_sender_id() or ""),
+                reason="user requested /stop",
+            )
+            event.set_extra("_gitee_bg_stop_cancelled", cancelled)
+            return
+        umo = str(event.unified_msg_origin or "")
+        gate = self._background_send_gates.get(umo)
+        if gate is None or gate.is_set():
+            gate = asyncio.Event()
+            self._background_send_gates[umo] = gate
+            manager.start_managed(
+                self._expire_background_send_gate(umo, gate),
+                name=f"background-reset-gate-{hashlib.sha256(umo.encode()).hexdigest()[:12]}",
+            )
+        event.set_extra("_gitee_bg_reset_candidate", command)
+
+    @staticmethod
+    def _background_plain_digest(event: AstrMessageEvent) -> tuple[str, str]:
+        result = event.get_result()
+        chain = getattr(result, "chain", None) if result is not None else None
+        plain = "".join(
+            str(getattr(component, "text", "") or "")
+            for component in chain or []
+            if isinstance(component, Plain)
+        ).strip()
+        digest = hashlib.sha256(plain.encode("utf-8")).hexdigest() if plain else ""
+        return plain, digest
+
+    @filter.on_decorating_result()
+    async def decorate_background_task_result(self, event: AstrMessageEvent) -> None:
+        """Ensure accepted events contain text and suppress empty completions.
+
+        Args:
+            event: Event whose final result is about to be sent.
+        """
+
+        manager = getattr(self, "background_tasks", None)
+        if manager is None:
+            return
+        ack_task_id = str(event.get_extra("_gitee_bg_ack_task_id", "") or "")
+        completion_task_id = str(event.get_extra("_gitee_bg_task_id", "") or "")
+        if not ack_task_id and not completion_task_id:
+            return
+        plain, _ = self._background_plain_digest(event)
+        if not plain:
+            if completion_task_id:
+                token = str(event.get_extra("_gitee_bg_notification_token", "") or "")
+                attempt_id = str(
+                    event.get_extra("_gitee_bg_notification_attempt", "") or ""
+                )
+                if token and attempt_id:
+                    await self._silence_background_notification(
+                        manager,
+                        token=token,
+                        task_id=completion_task_id,
+                        attempt_id=attempt_id,
+                        reason="agent completion contained no natural text",
+                    )
+                else:
+                    logger.warning(
+                        "[background-image] empty completion missing notification claim: task=%s",
+                        completion_task_id,
+                    )
+                event.stop_event()
+                return
+            result = event.get_result()
+            if result is None:
+                result = event.plain_result("")
+                event.set_result(result)
+            record = await manager.get_task(ack_task_id)
+            if record and record.get("task_kind") == "batch":
+                fallback = "我开始准备这组照片了，你们可以继续聊，拍好后我会发出来。"
+            else:
+                fallback = "我开始准备这张照片了，你们可以继续聊，拍好后我会发出来。"
+            result.chain.append(Plain(fallback))
+        plain, digest = self._background_plain_digest(event)
+        event.set_extra("_gitee_bg_final_plain_digest", digest)
+        if ack_task_id:
+            await manager.mark_ack(ack_task_id, "decorated")
+        if completion_task_id:
+            event.set_extra("_gitee_bg_completion_plain", plain)
+
+    @filter.on_decorating_result(priority=-1000000)
+    async def arm_background_task_result_transport(
+        self, event: AstrMessageEvent
+    ) -> None:
+        """Track the exact final result send after all normal decorators run.
+
+        Args:
+            event: Event whose final result will enter AstrBot's respond stage.
+        """
+
+        ack_task_id = str(event.get_extra("_gitee_bg_ack_task_id", "") or "")
+        token = str(event.get_extra("_gitee_bg_notification_token", "") or "")
+        if not ack_task_id and not token:
+            return
+        if bool(event.get_extra("_gitee_bg_transport_probe_armed", False)):
+            return
+
+        if token:
+            manager = getattr(self, "background_tasks", None)
+            attempt_id = str(
+                event.get_extra("_gitee_bg_notification_attempt", "") or ""
+            )
+            if manager is None or not attempt_id:
+                event.stop_event()
+                return
+            try:
+                claimed = await manager.mark_notification(
+                    token,
+                    "claimed",
+                    attempt_id=attempt_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[background-image] suppressed completion because the notification claim could not be verified: %s",
+                    BackgroundImageTaskManager.sanitize_error(exc),
+                )
+                event.stop_event()
+                return
+            if not claimed:
+                logger.warning(
+                    "[background-image] suppressed stale completion after watchdog takeover: token_hash=%s",
+                    hashlib.sha256(token.encode()).hexdigest()[:12],
+                )
+                event.stop_event()
+                return
+
+        original_send = event.send
+
+        async def tracked_send(*args, **kwargs):
+            """Forward a final send and record only a successful return.
+
+            Args:
+                *args: Positional arguments accepted by the adapter send method.
+                **kwargs: Keyword arguments accepted by the adapter send method.
+            """
+
+            try:
+                await original_send(*args, **kwargs)
+            except BaseException:
+                failures = int(
+                    event.get_extra("_gitee_bg_result_send_failures", 0) or 0
+                )
+                event.set_extra("_gitee_bg_result_send_failures", failures + 1)
+                raise
+            successes = int(event.get_extra("_gitee_bg_result_send_successes", 0) or 0)
+            event.set_extra("_gitee_bg_result_send_successes", successes + 1)
+
+        event.set_extra("_gitee_bg_transport_probe_armed", True)
+        setattr(event, "_gitee_bg_original_send", original_send)
+        setattr(event, "send", tracked_send)
+
+    @filter.after_message_sent(priority=200)
+    async def confirm_background_task_result(self, event: AstrMessageEvent) -> None:
+        """Confirm acceptance and terminal text only after adapter send returns.
+
+        Args:
+            event: Event after AstrBot's respond stage.
+        """
+
+        manager = getattr(self, "background_tasks", None)
+        if manager is None:
+            return
+        expected = str(event.get_extra("_gitee_bg_final_plain_digest", "") or "")
+        plain, actual = self._background_plain_digest(event)
+        probe_armed = bool(event.get_extra("_gitee_bg_transport_probe_armed", False))
+        probe_successes = int(
+            event.get_extra("_gitee_bg_result_send_successes", 0) or 0
+        )
+        probe_failures = int(event.get_extra("_gitee_bg_result_send_failures", 0) or 0)
+        probe_ok = probe_successes > 0 and probe_failures == 0
+        transport_ok = bool(getattr(event, "_has_send_oper", False))
+        digest_ok = bool(plain and expected and actual == expected)
+        confirmed = probe_ok if probe_armed else transport_ok and digest_ok
+        original_send = getattr(event, "_gitee_bg_original_send", None)
+        if original_send is not None:
+            setattr(event, "send", original_send)
+
+        ack_task_id = str(event.get_extra("_gitee_bg_ack_task_id", "") or "")
+        if ack_task_id:
+            try:
+                await manager.mark_ack(
+                    ack_task_id,
+                    "sent" if confirmed else "unknown",
+                )
+            except BackgroundTaskError:
+                pass
+
+        token = str(event.get_extra("_gitee_bg_notification_token", "") or "")
+        attempt_id = str(event.get_extra("_gitee_bg_notification_attempt", "") or "")
+        if token and attempt_id:
+            marked = await manager.mark_notification(
+                token,
+                "sent" if confirmed else "unknown",
+                attempt_id=attempt_id,
+            )
+            if not marked:
+                logger.warning(
+                    "[background-image] notification confirmation lost its claim: token_hash=%s",
+                    hashlib.sha256(token.encode()).hexdigest()[:12],
+                )
+
+        if ack_task_id or token:
+            logger.info(
+                "[background-image] result confirmation: kind=%s task=%s "
+                "probe_armed=%s probe_ok=%s probe_successes=%s probe_failures=%s "
+                "transport_flag=%s digest_ok=%s "
+                "plain_len=%s expected_hash=%s actual_hash=%s state=%s",
+                "completion" if token else "acceptance",
+                str(event.get_extra("_gitee_bg_task_id", "") or ack_task_id),
+                probe_armed,
+                probe_ok,
+                probe_successes,
+                probe_failures,
+                transport_ok,
+                digest_ok,
+                len(plain),
+                expected[:12],
+                actual[:12],
+                "sent" if confirmed else "unknown",
+            )
+
+        reset_command = str(event.get_extra("_gitee_bg_reset_candidate", "") or "")
+        if reset_command and bool(
+            event.get_extra("_clean_group_context_session", False)
+        ):
+            await self._cancel_background_scope_with_notifications(
+                manager,
+                umo=str(event.unified_msg_origin or ""),
+                sender_id=str(event.get_sender_id() or ""),
+                reason=f"session_reset:{reset_command}",
+                suppress_future_injection=True,
+            )
+        if reset_command:
+            umo = str(event.unified_msg_origin or "")
+            gate = self._background_send_gates.pop(umo, None)
+            if gate is not None:
+                gate.set()
+
+    def _remember_last_image(self, event: AstrMessageEvent, image_path: Path) -> None:
+        try:
+            user_id = str(event.get_sender_id() or "")
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+        except Exception:
+            user_id = ""
+            umo = ""
+        if not user_id or not umo:
+            return
+        self._last_image_by_user[f"{umo}::{user_id}"] = Path(image_path)
+
+    @staticmethod
+    def _as_int(value: Any, *, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _as_bool(value: Any, *, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+                return True
+            if v in {"0", "false", "no", "n", "off", "disable", "disabled", ""}:
+                return False
+        return default
+
+    def _patch_tool_image_cache_runtime(self) -> None:
+        try:
+            from astrbot.core.agent import tool_image_cache as cache_module
+        except Exception as exc:
+            logger.debug(
+                "[GiteeAIImagePlugin] skip tool image cache runtime patch: %s", exc
+            )
+            return
+
+        cache_cls = getattr(cache_module, "ToolImageCache", None)
+        cache_obj = getattr(cache_module, "tool_image_cache", None)
+        cached_image_cls = getattr(cache_module, "CachedImage", None)
+        if cache_cls is None or cache_obj is None or cached_image_cls is None:
+            return
+        if getattr(cache_cls, "_gitee_aiimg_runtime_patch", False):
+            return
+
+        def _patched_save_image(
+            cache_self,
+            base64_data: str,
+            tool_call_id: str,
+            tool_name: str,
+            index: int = 0,
+            mime_type: str = "image/png",
+        ):
+            ext = cache_self._get_file_extension(mime_type)
+            cache_dir_value = str(getattr(cache_self, "_cache_dir", "") or "").strip()
+            cache_dir = (
+                Path(cache_dir_value)
+                if cache_dir_value
+                else Path(get_astrbot_temp_path())
+                / getattr(cache_self, "CACHE_DIR_NAME", "tool_images")
+            )
+            file_path = cache_dir / f"{tool_call_id}_{index}{ext}"
+
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                image_bytes = base64.b64decode(base64_data)
+                file_path.write_bytes(image_bytes)
+            except Exception as exc:
+                logger.error(f"Failed to save tool image: {exc}")
+                raise
+
+            cache_self._cache_dir = str(cache_dir)
+            logger.debug(
+                "[GiteeAIImagePlugin] tool image cache runtime patch wrote: %s",
+                file_path,
+            )
+            return cached_image_cls(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                file_path=str(file_path),
+                mime_type=mime_type,
+            )
+
+        cache_cls.save_image = _patched_save_image
+        cache_cls._gitee_aiimg_runtime_patch = True
+        cache_obj._cache_dir = str(
+            Path(get_astrbot_temp_path())
+            / getattr(cache_cls, "CACHE_DIR_NAME", "tool_images")
+        )
+        Path(cache_obj._cache_dir).mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "[GiteeAIImagePlugin] tool image cache runtime patch active: %s",
+            cache_obj._cache_dir,
+        )
+
+    def _get_max_user_concurrency(self) -> int:
+        v = self._as_int(self.config.get("max_user_concurrency", 2), default=2)
+        return max(1, min(10, v))
+
+    def _get_max_user_video_concurrency(self) -> int:
+        v = self._as_int(self.config.get("max_user_video_concurrency", 1), default=1)
+        return max(1, min(5, v))
+
+    def _debounce_key(self, event: AstrMessageEvent, prefix: str, user_id: str) -> str:
+        """尽量用消息维度去重，避免同用户短时间内无法并发提交多条任务。"""
+        mid = str(
+            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+        ).strip()
+        origin = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if mid and origin:
+            return f"{prefix}:{origin}:{mid}"
+        return f"{prefix}:{user_id}"
+
+    def _is_duplicate_llm_image_call(self, event: AstrMessageEvent) -> bool:
+        """Keep one image tool event terminal after a slow or failed request."""
+        key = "_gitee_llm_image_request_handled"
+        getter = getattr(event, "get_extra", None)
+        setter = getattr(event, "set_extra", None)
+        if callable(getter) and getter(key, False):
+            return True
+        if callable(setter):
+            setter(key, True)
+
+        message_id = (
+            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+        )
+        origin = getattr(event, "unified_msg_origin", "") or ""
+        return bool(
+            message_id
+            and origin
+            and self.debouncer.llm_tool_is_duplicate(message_id, origin)
+        )
+
+    async def _begin_user_job(self, user_id: str, *, kind: str) -> bool:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return True
+
+        if kind == "video":
+            limit = self._get_max_user_video_concurrency()
+            store = self._video_inflight
+        else:
+            limit = self._get_max_user_concurrency()
+            store = self._image_inflight
+
+        async with self._concurrency_lock:
+            cur = int(store.get(user_id, 0) or 0)
+            if cur >= limit:
+                return False
+            store[user_id] = cur + 1
+            return True
+
+    async def _end_user_job(self, user_id: str, *, kind: str) -> None:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return
+
+        store = self._video_inflight if kind == "video" else self._image_inflight
+        async with self._concurrency_lock:
+            cur = int(store.get(user_id, 0) or 0)
+            if cur <= 1:
+                store.pop(user_id, None)
+            else:
+                store[user_id] = cur - 1
+
+    @staticmethod
+    def _is_rich_media_transfer_failed(exc: Exception | None) -> bool:
+        if exc is None:
+            return False
+        msg = f"{exc!r} {exc}".lower()
+        return "rich media transfer failed" in msg
+
+    def _get_send_conf(self) -> dict[str, Any]:
+        conf = self.config.get("send", {}) if isinstance(self.config, dict) else {}
+        return conf if isinstance(conf, dict) else {}
+
+    def _is_weixin_event(self, event: AstrMessageEvent | None) -> bool:
+        if not event:
+            return False
+        names: list[str] = []
+        try:
+            names.append(str(event.get_platform_name() or ""))
+        except Exception:
+            pass
+
+        platform_inst = getattr(event, "platform", None)
+        if platform_inst is not None:
+            try:
+                meta = platform_inst.meta() if hasattr(platform_inst, "meta") else None
+                if meta:
+                    names.append(str(getattr(meta, "name", "") or ""))
+                    names.append(str(getattr(meta, "id", "") or ""))
+            except Exception:
+                pass
+
+        return any(name.strip().lower() == "weixin_oc" for name in names)
+
+    def _get_weixin_timeout_ms(self) -> int:
+        conf = self._get_send_conf()
+        timeout_seconds = self._as_int(
+            conf.get("weixin_api_timeout_seconds", 60), default=60
+        )
+        timeout_ms = timeout_seconds * 1000
+        return max(15000, min(timeout_ms, 300000))
+
+    def _apply_weixin_timeout(self, platform_inst: Any) -> None:
+        if not platform_inst:
+            return
+        timeout_ms = self._get_weixin_timeout_ms()
+        try:
+            old_timeout = getattr(platform_inst, "api_timeout_ms", None)
+            if old_timeout != timeout_ms:
+                setattr(platform_inst, "api_timeout_ms", timeout_ms)
+
+            client = getattr(platform_inst, "client", None)
+            if client and getattr(client, "api_timeout_ms", None) != timeout_ms:
+                setattr(client, "api_timeout_ms", timeout_ms)
+        except Exception as exc:
+            logger.debug("[GiteeAIImagePlugin] 设置 weixin_oc 超时失败: %s", exc)
+
+    def _get_weixin_send_temp_dir(self) -> Path:
+        return Path(self.data_dir) / "Temp"
+
+    def _is_weixin_send_temp_path(self, image_path: Path) -> bool:
+        try:
+            p = Path(image_path).resolve(strict=False)
+            temp_dir = self._get_weixin_send_temp_dir().resolve(strict=False)
+            return (
+                p.parent == temp_dir
+                and p.name.startswith("weixin_send_")
+                and p.suffix.lower() == ".jpg"
+            )
+        except Exception:
+            return False
+
+    def _cleanup_weixin_send_temp_images_sync(self) -> None:
+        temp_dir = self._get_weixin_send_temp_dir()
+        try:
+            if not temp_dir.exists():
+                return
+
+            now = time.time()
+            entries: list[tuple[Path, float]] = []
+            for p in temp_dir.glob(self.WEIXIN_SEND_TEMP_PATTERN):
+                try:
+                    if not p.is_file():
+                        continue
+                    st = p.stat()
+                except OSError:
+                    continue
+                entries.append((p, st.st_mtime))
+
+            stale = [
+                p
+                for p, mtime in entries
+                if now - mtime > self.WEIXIN_SEND_TEMP_TTL_SECONDS
+            ]
+            stale_keys = {str(p.resolve(strict=False)) for p in stale}
+            remaining = [
+                item
+                for item in entries
+                if str(item[0].resolve(strict=False)) not in stale_keys
+            ]
+            if len(remaining) > self.WEIXIN_SEND_TEMP_MAX_FILES:
+                remaining.sort(key=lambda item: item[1])
+                overflow = len(remaining) - self.WEIXIN_SEND_TEMP_MAX_FILES
+                stale.extend(p for p, _ in remaining[:overflow])
+
+            seen: set[str] = set()
+            for p in stale:
+                try:
+                    key = str(p.resolve(strict=False))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    p.unlink(missing_ok=True)
+                except Exception as exc:
+                    logger.debug(
+                        "[GiteeAIImagePlugin] 清理 weixin_oc 临时图片失败: %s, err=%s",
+                        p,
+                        exc,
+                    )
+        except Exception as exc:
+            logger.debug("[GiteeAIImagePlugin] 扫描 weixin_oc 临时图片失败: %s", exc)
+
+    def _remove_weixin_send_temp_image_sync(self, image_path: Path) -> None:
+        p = Path(image_path)
+        if not self._is_weixin_send_temp_path(p):
+            return
+        try:
+            p.unlink(missing_ok=True)
+            logger.debug("[GiteeAIImagePlugin] 已清理 weixin_oc 发送临时图片: %s", p)
+        except Exception as exc:
+            logger.debug(
+                "[GiteeAIImagePlugin] 删除 weixin_oc 发送临时图片失败: %s, err=%s",
+                p,
+                exc,
+            )
+
+    def _compress_image_for_weixin_sync(self, image_path: Path) -> Path:
+        conf = self._get_send_conf()
+        if not self._as_bool(conf.get("weixin_compress_images", True), default=True):
+            return image_path
+
+        p = Path(image_path)
+        if not p.exists():
+            return p
+
+        try:
+            from PIL import Image as PILImage
+            from PIL import ImageOps
+        except Exception as exc:
+            logger.debug(
+                "[GiteeAIImagePlugin] Pillow 不可用，跳过 weixin_oc 图片优化: %s",
+                exc,
+            )
+            return p
+
+        max_side = self._as_int(conf.get("weixin_image_max_side", 4096), default=4096)
+        max_kb = self._as_int(
+            conf.get("weixin_image_max_size_kb", 10240), default=10240
+        )
+        max_side = max(1600, min(max_side, 8192))
+        target_bytes = max(512, max_kb) * 1024
+
+        try:
+            raw_size = p.stat().st_size
+            with PILImage.open(p) as im:
+                im = ImageOps.exif_transpose(im)
+                width, height = im.size
+                if raw_size <= target_bytes and max(width, height) <= max_side:
+                    return p
+
+                if im.mode in ("RGBA", "LA") or (
+                    im.mode == "P" and "transparency" in im.info
+                ):
+                    bg = PILImage.new("RGB", im.size, (255, 255, 255))
+                    rgba = im.convert("RGBA")
+                    bg.paste(rgba, mask=rgba.split()[-1])
+                    im = bg
+                else:
+                    im = im.convert("RGB")
+
+                if max(width, height) > max_side:
+                    resampling = getattr(
+                        getattr(PILImage, "Resampling", PILImage), "LANCZOS"
+                    )
+                    im.thumbnail((max_side, max_side), resampling)
+
+                temp_dir = Path(self.data_dir) / "Temp"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                self._cleanup_weixin_send_temp_images_sync()
+                digest_src = (
+                    f"{p}:{raw_size}:{p.stat().st_mtime}:{max_side}:{max_kb}".encode(
+                        "utf-8", errors="ignore"
+                    )
+                )
+                digest = hashlib.md5(digest_src).hexdigest()[:12]
+                out_path = temp_dir / f"weixin_send_{digest}_{time.time_ns()}.jpg"
+
+                for quality in (95, 93, 90, 88, 85, 82, 78, 74, 70):
+                    im.save(
+                        out_path,
+                        format="JPEG",
+                        quality=quality,
+                        optimize=True,
+                        progressive=True,
+                        subsampling=0 if quality >= 90 else -1,
+                    )
+                    if out_path.stat().st_size <= target_bytes:
+                        break
+
+                out_size = out_path.stat().st_size
+                if out_size < raw_size:
+                    logger.info(
+                        "[GiteeAIImagePlugin] 已为 weixin_oc 优化图片: %.2fMB -> %.2fMB, 分辨率 %sx%s -> %sx%s",
+                        raw_size / 1024 / 1024,
+                        out_size / 1024 / 1024,
+                        width,
+                        height,
+                        im.size[0],
+                        im.size[1],
+                    )
+                    return out_path
+        except Exception as exc:
+            logger.warning(
+                "[GiteeAIImagePlugin] weixin_oc 图片优化失败，继续发送原图: %s",
+                exc,
+            )
+
+        return p
+
+    async def _prepare_image_for_send(
+        self, event: AstrMessageEvent, image_path: Path
+    ) -> Path:
+        if self._is_weixin_event(event):
+            self._apply_weixin_timeout(getattr(event, "platform", None))
+            return await asyncio.to_thread(
+                self._compress_image_for_weixin_sync, image_path
+            )
+        return Path(image_path)
+
+    @staticmethod
+    def _build_compact_image_bytes(
+        image_path: Path, *, max_side: int = 2048, target_bytes: int = 3_500_000
+    ) -> bytes | None:
+        """Build a smaller JPEG variant for platforms that reject large rich-media upload."""
+        try:
+            from PIL import Image as PILImage
+        except Exception:
+            return None
+
+        try:
+            with PILImage.open(image_path) as im:
+                if im.mode not in {"RGB", "L"}:
+                    im = im.convert("RGB")
+                elif im.mode == "L":
+                    im = im.convert("RGB")
+
+                w, h = im.size
+                if max(w, h) > max_side:
+                    ratio = float(max_side) / float(max(w, h))
+                    nw = max(1, int(w * ratio))
+                    nh = max(1, int(h * ratio))
+                    resampling = getattr(
+                        getattr(PILImage, "Resampling", PILImage), "LANCZOS"
+                    )
+                    im = im.resize((nw, nh), resampling)
+
+                for q in (88, 82, 76, 70, 64):
+                    buf = io.BytesIO()
+                    im.save(
+                        buf,
+                        format="JPEG",
+                        quality=q,
+                        optimize=True,
+                        progressive=True,
+                    )
+                    data = buf.getvalue()
+                    if data and (len(data) <= target_bytes or q == 64):
+                        return data
+        except Exception:
+            return None
+        return None
+
+    def _is_selfie_enabled(self) -> bool:
+        conf = self._get_feature("selfie")
+        return self._as_bool(conf.get("enabled", True), default=True)
+
+    def _is_selfie_llm_enabled(self) -> bool:
+        conf = self._get_feature("selfie")
+        return self._as_bool(conf.get("llm_tool_enabled", True), default=True)
+
+    @staticmethod
+    def _selfie_disabled_message() -> str:
+        return "自拍参考图模式已关闭（features.selfie.enabled=false）"
+
+    async def _send_image_with_fallback(
+        self, event: AstrMessageEvent, image_path: Path, *, max_attempts: int = 5
+    ) -> SendImageResult:
+        """Send image with retries and fallback to base64 bytes.
+
+        Avoids wasting generation credits when platform send fails transiently.
+        """
+        original_path = Path(image_path)
+        p = await self._prepare_image_for_send(event, original_path)
+        should_cleanup_temp = self._is_weixin_send_temp_path(p) and (
+            p.resolve(strict=False) != original_path.resolve(strict=False)
+        )
+
+        async def finish(result: SendImageResult) -> SendImageResult:
+            if should_cleanup_temp:
+                await asyncio.to_thread(self._remove_weixin_send_temp_image_sync, p)
+                if result.cached_path == p:
+                    result.cached_path = original_path
+            return result
+
+        if not p.exists():
+            logger.warning("[send_image] file not found: %s", p)
+            return await finish(
+                SendImageResult(ok=False, reason="file_not_found", cached_path=p)
+            )
+
+        # Large original images (e.g. 4K 20MB+) are likely to fail rich-media upload.
+        # Prefer sending as a normal file first so the original bytes are preserved.
+        try:
+            size_bytes = int(p.stat().st_size)
+        except Exception:
+            size_bytes = 0
+
+        file_send_tries = 0
+
+        async def try_send_as_file(trigger: str) -> SendImageResult | None:
+            nonlocal file_send_tries
+            if file_send_tries >= 2:
+                return None
+            file_send_tries += 1
+            try:
+                await event.send(event.chain_result([File(name=p.name, file=str(p))]))
+                logger.info(
+                    "[send_image][file-fallback-v2] file send success: %s (%s bytes), trigger=%s, try=%s",
+                    p.name,
+                    size_bytes,
+                    trigger,
+                    file_send_tries,
+                )
+                return SendImageResult(
+                    ok=True,
+                    cached_path=p,
+                    used_fallback=True,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[send_image][file-fallback-v2] file send failed: trigger=%s, try=%s, err=%s",
+                    trigger,
+                    file_send_tries,
+                    e,
+                )
+                if self._is_unknown_delivery_error(e):
+                    return SendImageResult(
+                        ok=False,
+                        reason="delivery_unknown",
+                        cached_path=p,
+                        used_fallback=True,
+                        last_error=str(e),
+                    )
+                return None
+
+        if size_bytes > self.IMAGE_AS_FILE_THRESHOLD_BYTES:
+            file_result = await try_send_as_file("size_threshold")
+            if file_result is not None:
+                return await finish(file_result)
+
+        delay = 1.5
+        last_exc: Exception | None = None
+        attempts = max(1, int(max_attempts))
+        rich_media_failures = 0
+        compact_bytes: bytes | None = None
+        compact_prepared = False
+        for attempt in range(1, attempts + 1):
+            fs_exc: Exception | None = None
+            bytes_exc: Exception | None = None
+            compact_exc: Exception | None = None
+            fs_failed_by_rich_media = False
+
+            try:
+                await event.send(event.chain_result([Image.fromFileSystem(str(p))]))
+                return await finish(
+                    SendImageResult(ok=True, cached_path=p, used_fallback=False)
+                )
+            except Exception as e:
+                fs_exc = e
+                last_exc = e
+                if self._is_unknown_delivery_error(e):
+                    return await finish(
+                        SendImageResult(
+                            ok=False,
+                            reason="delivery_unknown",
+                            cached_path=p,
+                            last_error=str(e),
+                        )
+                    )
+                if self._is_rich_media_transfer_failed(e):
+                    fs_failed_by_rich_media = True
+                logger.debug(
+                    "[send_image] fromFileSystem failed (attempt=%s/%s): %s",
+                    attempt,
+                    attempts,
+                    e,
+                )
+
+            try:
+                data = await asyncio.to_thread(p.read_bytes)
+                await event.send(event.chain_result([Image.fromBytes(data)]))
+                if fs_exc is not None:
+                    logger.info(
+                        "[send_image] fromBytes fallback succeeded (attempt=%s/%s).",
+                        attempt,
+                        attempts,
+                    )
+                return await finish(
+                    SendImageResult(ok=True, cached_path=p, used_fallback=True)
+                )
+            except Exception as e:
+                bytes_exc = e
+                last_exc = e
+                if self._is_unknown_delivery_error(e):
+                    return await finish(
+                        SendImageResult(
+                            ok=False,
+                            reason="delivery_unknown",
+                            cached_path=p,
+                            used_fallback=True,
+                            last_error=str(e),
+                        )
+                    )
+                logger.debug(
+                    "[send_image] fromBytes failed (attempt=%s/%s): %s",
+                    attempt,
+                    attempts,
+                    e,
+                )
+
+            # If rich-media channel is failing, immediately try original-file sending.
+            if self._is_rich_media_transfer_failed(
+                fs_exc
+            ) or self._is_rich_media_transfer_failed(bytes_exc):
+                file_result = await try_send_as_file("rich_media_transfer_failed")
+                if file_result is not None:
+                    return await finish(file_result)
+
+            # Extra fallback for repeated rich-media failures: compress and retry by bytes.
+            if self._is_rich_media_transfer_failed(
+                fs_exc
+            ) or self._is_rich_media_transfer_failed(bytes_exc):
+                if not compact_prepared:
+                    compact_prepared = True
+                    compact_bytes = await asyncio.to_thread(
+                        self._build_compact_image_bytes, p
+                    )
+                    if compact_bytes:
+                        logger.info(
+                            "[send_image] prepared compact fallback image: %s -> %s bytes",
+                            p,
+                            len(compact_bytes),
+                        )
+                if compact_bytes:
+                    try:
+                        await event.send(
+                            event.chain_result([Image.fromBytes(compact_bytes)])
+                        )
+                        logger.info(
+                            "[send_image] compact fromBytes fallback succeeded (attempt=%s/%s).",
+                            attempt,
+                            attempts,
+                        )
+                        return await finish(
+                            SendImageResult(ok=True, cached_path=p, used_fallback=True)
+                        )
+                    except Exception as e:
+                        compact_exc = e
+                        last_exc = e
+                        if self._is_unknown_delivery_error(e):
+                            return await finish(
+                                SendImageResult(
+                                    ok=False,
+                                    reason="delivery_unknown",
+                                    cached_path=p,
+                                    used_fallback=True,
+                                    last_error=str(e),
+                                )
+                            )
+                        logger.debug(
+                            "[send_image] compact fromBytes failed (attempt=%s/%s): %s",
+                            attempt,
+                            attempts,
+                            e,
+                        )
+
+            attempt_has_rich_media = (
+                self._is_rich_media_transfer_failed(fs_exc)
+                or self._is_rich_media_transfer_failed(bytes_exc)
+                or self._is_rich_media_transfer_failed(compact_exc)
+            )
+            if attempt_has_rich_media:
+                rich_media_failures += 1
+
+            if fs_exc is not None and bytes_exc is not None and compact_exc is not None:
+                logger.debug(
+                    "[send_image] attempt=%s/%s failed on all channels.",
+                    attempt,
+                    attempts,
+                )
+            elif fs_exc is not None and bytes_exc is not None:
+                logger.debug(
+                    "[send_image] attempt=%s/%s failed on both channels.",
+                    attempt,
+                    attempts,
+                )
+            elif fs_exc is not None and fs_failed_by_rich_media:
+                logger.debug(
+                    "[send_image] attempt=%s/%s failed by rich media transfer.",
+                    attempt,
+                    attempts,
+                )
+            else:
+                logger.debug(
+                    "[send_image] attempt=%s/%s failed to send image.",
+                    attempt,
+                    attempts,
+                )
+
+            if rich_media_failures >= 2:
+                logger.info(
+                    "[send_image] detected repeated rich media transfer failures, stop retrying early."
+                )
+                break
+
+            if attempt < attempts:
+                await _async_pause(delay)
+                delay = min(delay * 1.8, 8.0)
+
+        reason = (
+            "rich_media_transfer_failed"
+            if self._is_rich_media_transfer_failed(last_exc)
+            else "send_failed"
+        )
+        logger.error(
+            "[send_image] failed after retries: reason=%s, err=%s", reason, last_exc
+        )
+        return await finish(
+            SendImageResult(
+                ok=False,
+                reason=reason,
+                cached_path=p,
+                last_error=str(last_exc or ""),
+            )
+        )
+
+    def _register_preset_commands(self):
+        """动态注册预设命令
+
+        为每个预设创建对应的命令，如 /手办化, /Q版化 等
+        """
+        preset_names = self.edit.get_preset_names()
+        if not preset_names:
+            return
+
+        for preset_name in preset_names:
+            # 创建闭包捕获 preset_name
+            self._create_and_register_preset_handler(preset_name)
+
+        logger.info(f"[GiteeAIImagePlugin] 已注册 {len(preset_names)} 个预设命令")
+
+    def _create_and_register_preset_handler(self, preset_name: str):
+        """为单个预设创建并注册命令处理器
+
+        支持: /手办化 [额外提示词]
+        例如: /手办化 加点金色元素
+        """
+
+        # 默认后端命令: /手办化
+        async def preset_handler(event: AstrMessageEvent):
+            # 提取命令后的额外提示词
+            extra_prompt = self._extract_extra_prompt(event, preset_name)
+            await self._do_edit_direct(event, extra_prompt, preset=preset_name)
+
+        preset_handler.__name__ = f"preset_{preset_name}"
+        preset_handler.__doc__ = f"预设改图: {preset_name} [额外提示词]"
+
+        self.context.register_commands(
+            star_name="astrbot_plugin_gitee_aiimg",
+            command_name=preset_name,
+            desc=f"预设改图: {preset_name}",
+            priority=5,
+            awaitable=preset_handler,
+        )
+
+    def _extract_extra_prompt(self, event: AstrMessageEvent, command_name: str) -> str:
+        """从消息中提取命令后的额外提示词
+
+        支持格式:
+        - /手办化 加点金色元素 -> "加点金色元素"
+        - /手办化@张三 背景是星空 -> "背景是星空"
+        - /手办化@张三@李四 背景是星空 -> "背景是星空"
+
+        注意: message_str 中 @用户 会被替换为空格或移除
+        """
+        msg = event.message_str.strip()
+        # 移除命令前缀 (/, !, ., 等)
+        # 兼容唤醒前缀：.视频 / 。视频 / ．视频
+        if msg and msg[0] in "/!！.。．":
+            msg = msg[1:]
+        # 移除命令名
+        if msg.startswith(command_name):
+            msg = msg[len(command_name) :]
+        msg = re.sub(r"@\S+\(\d+\)", " ", msg)
+        # 清理多余空格
+        return msg.strip()
+
+    def _cmd_prefixes(self) -> tuple[str, ...]:
+        """Return configured AstrBot wake prefixes for command matching."""
+        return getattr(self, "_wake_prefixes", None) or ("/",)
+
+    @staticmethod
+    def _extract_command_arg_anywhere(
+        message: str, command_name: str, *, prefixes: tuple[str, ...] | None = None
+    ) -> str:
+        """从任意位置提取"/命令 参数"，用于图片在前导致 @filter.command 不触发的场景。"""
+        _found, arg = GiteeAIImagePlugin._find_command_arg_anywhere(
+            message,
+            command_name,
+            prefixes=prefixes,
+        )
+        return arg
+
+    @staticmethod
+    def _find_command_arg_anywhere(
+        message: str,
+        command_name: str,
+        *,
+        allow_bare: bool = False,
+        prefixes: tuple[str, ...] | None = None,
+    ) -> tuple[bool, str]:
+        """查找带前缀命令；已被 AstrBot wake_prefix 剥离时允许裸命令。
+        prefixes 为 None 时回退到全量集合（兼容静态调用场景）。
+        """
+        msg = (message or "").strip()
+        if not msg:
+            return False, ""
+        effective_prefixes = (
+            prefixes if prefixes is not None else ("/", "!", "！", ".", "。", "．")
+        )
+        for prefix in effective_prefixes:
+            token = f"{prefix}{command_name}"
+            idx = msg.find(token)
+            while idx >= 0:
+                end = idx + len(token)
+                if end == len(msg) or msg[end].isspace():
+                    return True, msg[end:].strip()
+                idx = msg.find(token, idx + 1)
+        if allow_bare and msg.startswith(command_name):
+            end = len(command_name)
+            if end == len(msg) or msg[end].isspace():
+                return True, msg[end:].strip()
+        return False, ""
+
+    def _extract_command_arg_from_chain(
+        self, event: AstrMessageEvent, command_name: str
+    ) -> tuple[bool, str]:
+        """从消息链中提取命令后的提示词。
+
+        用于修复"/命令 + 图片 + 文本"时，平台把文本段无空格拼接到 `message_str`
+        导致 command filter 和字符串提取都失效的问题。
+        """
+        try:
+            chain = event.get_messages()
+        except Exception:
+            return False, ""
+
+        found = False
+        parts: list[str] = []
+        for seg in chain:
+            if isinstance(seg, (At, AtAll, Reply)):
+                continue
+
+            if not found:
+                if not isinstance(seg, Plain):
+                    continue
+                plain = str(getattr(seg, "text", "") or "").lstrip()
+                if not plain:
+                    continue
+                matched_prefix = next(
+                    (
+                        prefix
+                        for prefix in self._cmd_prefixes()
+                        if plain.startswith(f"{prefix}{command_name}")
+                    ),
+                    None,
+                )
+                if matched_prefix is None:
+                    continue
+                plain = plain[len(matched_prefix) :]
+                end = len(command_name)
+                if len(plain) > end and not plain[end].isspace():
+                    continue
+                found = True
+                tail = plain[len(command_name) :].strip()
+                if tail:
+                    parts.append(tail)
+                continue
+
+            if isinstance(seg, Plain):
+                text = str(getattr(seg, "text", "") or "").strip()
+                if text:
+                    parts.append(text)
+
+        return found, " ".join(parts).strip()
+
+    def _extract_chain_provider_id(self, item: object) -> str:
+        if isinstance(item, str):
+            return item.strip()
+        if not isinstance(item, dict):
+            return ""
+        return str(
+            item.get("provider_id")
+            or item.get("id")
+            or item.get("provider")
+            or item.get("backend")
+            or ""
+        ).strip()
+
+    def _normalize_chain_item(self, item: object) -> dict | None:
+        pid = self._extract_chain_provider_id(item)
+        if not pid:
+            return None
+        out = ""
+        if isinstance(item, dict):
+            out = str(item.get("output") or item.get("default_output") or "").strip()
+        return {"provider_id": pid, "output": out} if out else {"provider_id": pid}
+
+    def _parse_provider_override_prefix(self, text: str) -> tuple[str | None, str]:
+        """仅当 @token 命中已配置 provider_id 时，才作为 provider 覆盖。"""
+        s = (text or "").strip()
+        if not s.startswith("@"):
+            return None, s
+        parts = s.split(maxsplit=1)
+        first, rest = parts[0], parts[1] if len(parts) > 1 else ""
+        candidate = first.lstrip("@").strip()
+        if not candidate:
+            return None, s
+        if candidate in set(self.registry.provider_ids()):
+            return candidate, rest.strip()
+        logger.debug(
+            "[provider_override] 忽略未知 @token，继续走自动链路: token=%s",
+            candidate,
+        )
+        return None, s
+
+    @filter.regex(r"(?:aiimg|aiedit|自拍)\S+(?:\s|$)", priority=5)
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def provider_image_command(self, event: AstrMessageEvent):
+        """Handle /aiimg<provider_id>, /aiedit<provider_id> and /自拍<provider_id>."""
+        if event.get_extra("_gitee_provider_command_handled", False):
+            return
+        try:
+            chain = event.get_messages()
+        except Exception:
+            return
+        command = provider_id = ""
+        parts = []
+        for seg in chain or []:
+            if not isinstance(seg, Plain):
+                continue
+            text = str(getattr(seg, "text", "") or "").strip()
+            if command:
+                if text:
+                    parts.append(text)
+                continue
+            body = None
+            for prefix in self._cmd_prefixes():
+                if text.startswith(prefix):
+                    body = text[len(prefix) :]
+                    break
+            if body is None:
+                if not (
+                    ImageCommandWakePrefixFilter._is_private_chat(event)
+                    and getattr(event, "is_at_or_wake_command", False)
+                ):
+                    continue
+                body = text
+            tokens = body.split(maxsplit=1)
+            if not tokens:
+                continue
+            token = tokens[0]
+            if token == "自拍参考" or token in self.edit.get_preset_names():
+                return
+            for name in ("aiimg", "aiedit", "自拍"):
+                if token.startswith(name) and token != name:
+                    command, provider_id = name, token[len(name) :]
+                    if len(tokens) > 1:
+                        parts.append(tokens[1])
+                    break
+            if not command:
+                # Only the first command in a text segment owns its arguments.
+                return
+        if not command:
+            return
+        event.set_extra("_gitee_provider_command_handled", True)
+        try:
+            if provider_id not in self.registry.provider_ids():
+                event.should_call_llm(False)
+                await event.send(event.plain_result(f"未配置图片渠道: {provider_id}"))
+                await mark_failed(event)
+                return
+            prompt = "\n".join(parts).strip()
+            if command == "aiimg":
+                await self._do_draw(event, prompt, provider_id=provider_id)
+            elif command == "aiedit":
+                await self._do_edit(event, prompt, backend=provider_id)
+            else:
+                await self._do_selfie(event, prompt, backend=provider_id)
+        finally:
+            event.stop_event()
+
+    @staticmethod
+    def _plain_starts_with_command(
+        text: str, command_name: str, *, prefixes: tuple[str, ...] | None = None
+    ) -> bool:
+        plain = (text or "").lstrip()
+        if not plain:
+            return False
+        effective_prefixes = (
+            prefixes if prefixes is not None else ("/", "!", "！", ".", "。", "．")
+        )
+        for prefix in effective_prefixes:
+            if plain.startswith(f"{prefix}{command_name}"):
+                return True
+        return False
+
+    def _is_direct_command_message(
+        self, event: AstrMessageEvent, command_names: tuple[str, ...]
+    ) -> bool:
+        """仅当"首个有效文本段"直接是命令时返回 True。
+
+        用于 regex 兜底去重：避免正常 /命令 被重复处理；
+        同时允许"图片在前、命令在后"的消息继续走兜底逻辑。
+        """
+        try:
+            chain = event.get_messages()
+        except Exception:
+            return False
+        if not chain:
+            return False
+
+        first_plain = ""
+        for seg in chain:
+            if isinstance(seg, (At, AtAll, Reply)):
+                continue
+            if isinstance(seg, Plain):
+                first_plain = str(getattr(seg, "text", "") or "")
+            break
+
+        if not first_plain:
+            return False
+        return any(
+            self._plain_starts_with_command(
+                first_plain, name, prefixes=self._cmd_prefixes()
+            )
+            for name in command_names
+        )
+
+    @staticmethod
+    def _is_framework_direct_command_text(
+        message: str, command_names: tuple[str, ...], *, allow_bare: bool = True
+    ) -> bool:
+        """按 AstrBot CommandFilter 的文本规则判断是否可直接命中 command handler。"""
+        plain = " ".join(str(message or "").strip().split())
+        if not plain:
+            return False
+        if plain[0] in "/!！.。．":
+            plain = plain[1:].lstrip()
+        return any(
+            (plain == name if allow_bare else False) or plain.startswith(f"{name} ")
+            for name in command_names
+        )
+
+    @staticmethod
+    def _has_activated_handler(event: AstrMessageEvent, handler_name: str) -> bool:
+        """检查本轮事件是否已经激活指定 handler，用于 regex fallback 去重。"""
+        try:
+            handlers = event.get_extra("activated_handlers", [])
+        except Exception:
+            return False
+        for handler in handlers or []:
+            if str(getattr(handler, "handler_name", "") or "") == handler_name:
+                return True
+            raw_handler = getattr(handler, "handler", None)
+            if str(getattr(raw_handler, "__name__", "") or "") == handler_name:
+                return True
+        return False
+
+    async def terminate(self):
+        if getattr(self, "studio", None):
+            await self.studio.close()
+        self.debouncer.clear_all()
+        start_task = getattr(self, "_background_start_task", None)
+        if start_task is not None:
+            start_task.cancel()
+            await asyncio.gather(start_task, return_exceptions=True)
+            self._background_start_task = None
+        manager = getattr(self, "background_tasks", None)
+        if manager is not None:
+            try:
+                await manager.close()
+            except Exception as exc:
+                logger.error(
+                    "[background-image] manager shutdown failed: %s",
+                    BackgroundImageTaskManager.sanitize_error(exc),
+                )
+            finally:
+                self.background_tasks = None
+        try:
+            tasks = list(getattr(self, "_video_tasks", []))
+            for t in tasks:
+                t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception:
+            pass
+        await self.imgr.close()
+        await self.draw.close()
+        await self.edit.close()
+        await self.nb.close()
+        await close_session()  # 关闭 utils.py 的 HTTP 会话
+
+    # ==================== 文生图 ====================
+
+    @filter.command("文生图")
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def generate_image_with_presets(self, event: AstrMessageEvent):
+        """支持文生图预设的图片生成命令。"""
+        event.should_call_llm(True)
+        parsed = self._parse_structured_image_request(event.message_str)
+        if parsed is None or parsed.spec.source_command != "文生图":
+            await mark_failed(event)
+            return
+
+        spec = parsed.spec
+        if not str(spec.effective_prompt or "").strip():
+            await mark_failed(event)
+            return
+
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "draw_preset", user_id)
+        if self.debouncer.hit(request_id):
+            await mark_failed(event)
+            return
+        if not await self._begin_user_job(user_id, kind="image"):
+            await mark_failed(event)
+            return
+
+        try:
+            await mark_processing(event)
+            executed = await self._execute_image_task_spec(event, spec)
+            self._remember_last_image(event, executed.image_path)
+            sent = await self._send_image_with_fallback(event, executed.image_path)
+            if not sent:
+                await mark_failed(event)
+                return
+            await self._save_last_image_task_meta(event, executed.task_meta)
+            await mark_success(event)
+        except Exception as exc:
+            logger.error("[文生图预设] 失败: %s", exc, exc_info=True)
+            await mark_failed(event)
+        finally:
+            await self._end_user_job(user_id, kind="image")
+
+    @filter.command("aiimg", alias={"生图", "画图", "绘图", "出图"})
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def generate_image_command(self, event: AstrMessageEvent, prompt: str):
+        """生成图片指令
+
+        用法: /aiimg [@provider_id] <提示词> [比例]
+        示例: /aiimg 一个女孩 9:16
+        支持比例: 1:1, 4:3, 3:4, 3:2, 2:3, 16:9, 9:16
+        """
+        parts = str(event.message_str or "").split(maxsplit=1)
+        arg = parts[1] if len(parts) > 1 else ""
+        await self._do_draw(event, arg)
+
+    async def _do_draw(
+        self,
+        event: AstrMessageEvent,
+        arg: str,
+        *,
+        provider_id: str | None = None,
+    ):
+        """Execute a draw command with an optional pinned provider."""
+        event.should_call_llm(True)
+        if not arg:
+            await mark_failed(event)
+            return
+        provider_override = provider_id
+        if provider_override is None:
+            provider_override, arg = self._parse_provider_override_prefix(arg)
+        if not arg:
+            await mark_failed(event)
+            return
+
+        try:
+            prompt, output_intent = split_prompt_output_suffix(arg)
+        except ValueError as exc:
+            logger.warning("[aiimg] 输出参数无效: %s", exc)
+            await mark_failed(event)
+            return
+
+        if not prompt:
+            await mark_failed(event)
+            return
+
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "generate", user_id)
+
+        # 防抖检查
+        if self.debouncer.hit(request_id):
+            await mark_failed(event)
+            return
+
+        if not await self._begin_user_job(user_id, kind="image"):
+            await mark_failed(event)
+            return
+
+        try:
+            # 标记处理中
+            await mark_processing(event)
+            t_start = time.perf_counter()
+            image_path = await self.draw.generate(
+                prompt,
+                output_intent=output_intent,
+                provider_id=provider_override,
+            )
+            t_end = time.perf_counter()
+
+            self._remember_last_image(event, image_path)
+            sent = await self._send_image_with_fallback(event, image_path)
+            if not sent:
+                await mark_failed(event)
+                logger.warning(
+                    "[文生图] 图片发送失败，已仅使用表情标注: reason=%s", sent.reason
+                )
+                return
+
+            # 标记成功
+            await mark_success(event)
+            logger.info(
+                f"[文生图] 完成: {prompt[:30] if prompt else '文生图'}..., 耗时={t_end - t_start:.2f}s"
+            )
+
+        except Exception as e:
+            logger.error(f"[文生图] 失败: {e}")
+            await mark_failed(event)
+        finally:
+            await self._end_user_job(user_id, kind="image")
+
+    @filter.regex(r"[/!！.。．]批量(?:\s*\d+|\d+)(?:\s|$)", priority=-10)
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def batch_image_command(self, event: AstrMessageEvent):
+        """批量图片任务入口。"""
+        fragment = self._extract_batch_command_fragment(event)
+        if not fragment:
+            return
+        event.should_call_llm(True)
+        parsed = self._parse_structured_image_request(fragment)
+        if parsed is None or parsed.batch_count <= 1:
+            await mark_failed(event)
+            return
+        if parsed.batch_count > self._get_batch_max_count():
+            await event.send(
+                event.plain_result(
+                    f"批量数量过大，当前上限为 {self._get_batch_max_count()}。"
+                )
+            )
+            await mark_failed(event)
+            return
+
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "batch_image", user_id)
+        if self.debouncer.hit(request_id):
+            await mark_failed(event)
+            return
+        if not await self._begin_user_job(user_id, kind="image"):
+            await mark_failed(event)
+            return
+
+        try:
+            await mark_processing(event)
+            specs = [parsed.spec for _ in range(parsed.batch_count)]
+            results = await self._run_batch_specs(event, specs)
+            title = f"{self._batch_mode_label(parsed.spec)} x{parsed.batch_count}"
+            await self._send_batch_results(event, results, title=title)
+            if any(result.success and result.value for result in results):
+                await self._remember_batch_success(event, results)
+                await mark_success(event)
+            else:
+                await mark_failed(event)
+        except Exception as exc:
+            logger.error("[批量图片] 失败: %s", exc, exc_info=True)
+            await mark_failed(event)
+        finally:
+            await self._end_user_job(user_id, kind="image")
+
+    # ==================== 图生图/改图 ====================
+
+    @filter.command("aiedit", alias={"图生图", "改图", "修图"})
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def edit_image_default(self, event: AstrMessageEvent, prompt: str):
+        """使用默认后端改图
+
+        用法: /aiedit <提示词>
+        需要同时发送或引用图片
+        """
+        event.should_call_llm(True)
+        # CommandFilter binds a plain ``str`` parameter to one whitespace token.
+        # Re-read the raw command so provider overrides do not consume the prompt.
+        raw_message = str(getattr(event, "message_str", "") or "").strip()
+        raw_parts = raw_message.split(maxsplit=1)
+        command_prompt = raw_parts[1].strip() if len(raw_parts) == 2 else ""
+        if not command_prompt:
+            command_prompt = prompt
+        try:
+            await self._do_edit(event, command_prompt, backend=None)
+        finally:
+            event.stop_event()
+
+    @filter.command("重发图片")
+    async def resend_last_image(self, event: AstrMessageEvent):
+        """重发最近一次生成/改图的图片（不重新生成，不消耗次数）。"""
+        user_id = str(event.get_sender_id() or "")
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        p = self._last_image_by_user.get(f"{umo}::{user_id}")
+        if not p:
+            await mark_failed(event)
+            return
+        if not Path(p).exists():
+            await mark_failed(event)
+            return
+        ok = await self._send_image_with_fallback(event, p)
+        if ok:
+            await mark_success(event)
+        else:
+            await mark_failed(event)
+
+    @filter.regex(r".*[/!！.。．](改图|图生图|修图|aiedit)(?:\s|$)", priority=-10)
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def edit_image_regex_fallback(self, event: AstrMessageEvent):
+        """兼容"图片在前、文字在后"的消息：确保 /改图 能触发。"""
+        msg = (event.message_str or "").strip()
+        command_names = ("改图", "图生图", "修图", "aiedit")
+        if self._is_framework_direct_command_text(msg, command_names, allow_bare=False):
+            return
+        try:
+            if not await self._has_message_images_or_avatar_mentions(event):
+                return
+        except Exception:
+            return
+
+        prompt = ""
+        matched = False
+        for name in command_names:
+            found_in_chain, prompt = self._extract_command_arg_from_chain(event, name)
+            if found_in_chain:
+                matched = True
+                break
+        if matched:
+            event.should_call_llm(True)
+            await self._do_edit(event, prompt, backend=None)
+            event.stop_event()
+
+    @filter.regex(r".*[/!！.。．][^\s]+", priority=-10)
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def preset_regex_fallback(self, event: AstrMessageEvent):
+        """兼容"图片在前、预设命令在后"的消息：确保 /<预设名> 能触发。"""
+        preset_names = self.edit.get_preset_names()
+        if not preset_names:
+            return
+
+        # 如果首段文本本来就是 /预设，则交给 command handler，避免重复处理
+        try:
+            if self._is_direct_command_message(event, tuple(preset_names)):
+                return
+        except Exception:
+            pass
+
+        # 仅当消息/引用里有图或有效 @ 头像目标时才兜底，避免误伤其它插件命令
+        try:
+            if not await self._has_message_images_or_avatar_mentions(event):
+                return
+        except Exception:
+            return
+
+        # Match only a complete preset command at the start of a raw text segment.
+        used_preset: str | None = None
+        extra_prompt = ""
+        for name in preset_names:
+            found, prompt = self._extract_command_arg_from_chain(event, name)
+            if found:
+                used_preset = name
+                extra_prompt = prompt
+                break
+
+        if not used_preset:
+            return
+
+        await self._do_edit_direct(event, extra_prompt, preset=used_preset)
+        event.stop_event()
+
+    # ==================== Bot 自拍（参考照） ====================
+
+    @filter.command("自拍")
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def selfie_command(self, event: AstrMessageEvent):
+        """使用"自拍参考照"生成 Bot 自拍。
+
+        用法:
+        - /自拍 <提示词>
+        - 可附带多张参考图（衣服/姿势/场景）作为额外参考
+        """
+        if not self._is_selfie_enabled():
+            await mark_failed(event)
+            return
+        event.should_call_llm(True)
+        prompt = self._extract_extra_prompt(event, "自拍")
+        await self._do_selfie(event, prompt, backend=None)
+
+    @filter.regex(r".*[/!！.。．]自拍(?:\s|$)", priority=-10)
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def selfie_regex_fallback(self, event: AstrMessageEvent):
+        """兼容"图片在前、文字在后"的消息：确保 /自拍 能触发。"""
+        if self._has_activated_handler(event, "selfie_command"):
+            return
+        found, prompt = self._extract_command_arg_from_chain(event, "自拍")
+        if found:
+            event.should_call_llm(True)
+            if not self._is_selfie_enabled():
+                await mark_failed(event)
+                event.stop_event()
+                return
+            await self._do_selfie(event, prompt, backend=None)
+            event.stop_event()
+
+    @filter.command("自拍参考")
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def selfie_reference_command(self, event: AstrMessageEvent):
+        """管理自拍参考照（建议仅管理员使用）。
+
+        用法:
+        - 发送图片 + /自拍参考 设置
+        - /自拍参考 查看
+        - /自拍参考 删除
+        """
+        event.should_call_llm(True)
+        if not self._is_selfie_enabled():
+            await mark_failed(event)
+            return
+        arg = self._extract_extra_prompt(event, "自拍参考")
+        action, _, _rest = (arg or "").strip().partition(" ")
+        action = action.strip().lower()
+
+        if not action or action in {"帮助", "help", "h"}:
+            msg = (
+                "📸 自拍参考照\n"
+                "━━━━━━━━━━━━━━\n"
+                "设置：发送图片 + /自拍参考 设置\n"
+                "查看：/自拍参考 查看\n"
+                "删除：/自拍参考 删除\n"
+                "━━━━━━━━━━━━━━\n"
+                "生成自拍：/自拍 <提示词>\n"
+                "可附带额外参考图（衣服/姿势/场景）"
+            )
+            yield event.plain_result(msg)
+            return
+
+        if action in {"设置", "set"}:
+            await self._set_selfie_reference(event)
+            return
+
+        if action in {"查看", "show", "看"}:
+            async for result in self._show_selfie_reference(event):
+                yield result
+            return
+
+        if action in {"删除", "del", "delete"}:
+            await self._delete_selfie_reference(event)
+            return
+
+        await mark_failed(event)
+
+    @filter.regex(r".*[/!！.。．]自拍参考(?:\s|$)", priority=-10)
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def selfie_reference_regex_fallback(self, event: AstrMessageEvent):
+        """兼容"图片在前、文字在后"的消息：确保 /自拍参考 能触发。"""
+        if self._has_activated_handler(event, "selfie_reference_command"):
+            return
+        found, arg = self._extract_command_arg_from_chain(event, "自拍参考")
+        if not found:
+            return
+        event.should_call_llm(True)
+        if not self._is_selfie_enabled():
+            await mark_failed(event)
+            event.stop_event()
+            return
+        action, _, _rest = (arg or "").strip().partition(" ")
+        action = action.strip().lower()
+
+        if not action or action in {"帮助", "help", "h"}:
+            yield event.plain_result(
+                "📸 自拍参考照\n"
+                "━━━━━━━━━━━━━━\n"
+                "设置：发送图片 + /自拍参考 设置\n"
+                "查看：/自拍参考 查看\n"
+                "删除：/自拍参考 删除\n"
+                "━━━━━━━━━━━━━━\n"
+                "生成自拍：/自拍 <提示词>\n"
+                "可附带额外参考图（衣服/姿势/场景）"
+            )
+            event.stop_event()
+            return
+
+        if action in {"设置", "set"}:
+            await self._set_selfie_reference(event)
+            event.stop_event()
+            return
+
+        if action in {"查看", "show", "看"}:
+            async for r in self._show_selfie_reference(event):
+                yield r
+            event.stop_event()
+            return
+
+        if action in {"删除", "del", "delete"}:
+            await self._delete_selfie_reference(event)
+            event.stop_event()
+            return
+
+        await mark_failed(event)
+        event.stop_event()
+
+    # ==================== 视频生成 ====================
+
+    async def _capture_video_image_snapshot(
+        self,
+        event: AstrMessageEvent,
+    ) -> tuple[bool, bytes | None]:
+        """Materialize the reference image before the event temp files are cleaned."""
+        image_segs = await get_images_from_event(
+            event,
+            include_avatar=True,
+            include_sender_avatar_fallback=False,
+        )
+        raw_image_segs: list[Image] = []
+        if callable(get_raw_images_from_event):
+            try:
+                raw_image_segs = await get_raw_images_from_event(event)
+            except Exception as exc:
+                logger.warning("[视频] raw OneBot 图片回源失败: %s", exc)
+
+        had_image = bool(image_segs or raw_image_segs)
+        candidates = [*image_segs, *raw_image_segs]
+        logger.info(
+            "[视频] 图片快照候选: event=%s raw=%s total=%s",
+            len(image_segs),
+            len(raw_image_segs),
+            len(candidates),
+        )
+        snapshot_errors: list[tuple[int, Exception]] = []
+        for i, seg in enumerate(candidates):
+            try:
+                b64 = await seg.convert_to_base64()
+                image_bytes = decode_base64_image_payload(b64)
+                mime_type, _ = guess_image_mime_and_ext(image_bytes)
+                source = "event" if i < len(image_segs) else "raw"
+                logger.info(
+                    "[视频] 图片快照完成: source=%s index=%s bytes=%s mime=%s",
+                    source,
+                    i + 1,
+                    len(image_bytes),
+                    mime_type,
+                )
+                return had_image, image_bytes
+            except Exception as exc:
+                snapshot_errors.append((i + 1, exc))
+                logger.debug("[视频] 图片 %s 快照失败，尝试下一张: %s", i + 1, exc)
+        if snapshot_errors:
+            for index, exc in snapshot_errors:
+                logger.warning("[视频] 图片 %s 快照失败: %s", index, exc)
+        return had_image, None
+
+    @filter.command("视频")
+    async def generate_video_command(self, event: AstrMessageEvent):
+        """生成视频
+
+        用法:
+        - /视频 [@provider_id] <提示词>
+        - /视频 [@provider_id] <预设名> [额外提示词]
+        """
+        event.should_call_llm(True)
+        if not bool(self._get_feature("video").get("enabled", False)):
+            await mark_failed(event)
+            return
+        arg = self._extract_extra_prompt(event, "视频")
+        if not arg:
+            await mark_failed(event)
+            return
+
+        provider_override, arg = self._parse_provider_override_prefix(arg)
+        if not arg:
+            await mark_failed(event)
+            return
+
+        preset, prompt = self._parse_video_args(arg)
+        presets = self._get_video_presets()
+        if preset and preset in presets:
+            preset_prompt = presets[preset]
+            prompt = f"{preset_prompt}, {prompt}" if prompt else preset_prompt
+
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "video", user_id)
+
+        if self.debouncer.hit(request_id):
+            await mark_failed(event)
+            return
+
+        if not await self._video_begin(user_id):
+            await mark_failed(event)
+            return
+
+        try:
+            await mark_processing(event)
+        except Exception:
+            await self._video_end(user_id)
+            await mark_failed(event)
+            return
+
+        try:
+            image_snapshot = await self._capture_video_image_snapshot(event)
+            task = asyncio.create_task(
+                self._async_generate_video(
+                    event,
+                    prompt,
+                    user_id,
+                    provider_id=provider_override,
+                    image_snapshot=image_snapshot,
+                )
+            )
+        except Exception:
+            await self._video_end(user_id)
+            await mark_failed(event)
+            return
+
+        self._video_tasks.add(task)
+        task.add_done_callback(lambda t: self._video_tasks.discard(t))
+        return
+
+    @filter.regex(r"[/!！.。．]视频(\s|$)", priority=-10)
+    @filter.custom_filter(ImageCommandWakePrefixFilter)
+    async def generate_video_regex_fallback(self, event: AstrMessageEvent):
+        """兼容"图片在前、文字在后"的消息：确保 /视频 能触发。"""
+        if self._is_direct_command_message(event, ("视频",)):
+            return
+
+        found, arg = self._extract_command_arg_from_chain(event, "视频")
+        if not found:
+            return
+
+        event.should_call_llm(True)
+        if not bool(self._get_feature("video").get("enabled", False)):
+            await mark_failed(event)
+            event.stop_event()
+            return
+        if not arg:
+            await mark_failed(event)
+            event.stop_event()
+            return
+
+        provider_override, arg = self._parse_provider_override_prefix(arg)
+        if not arg:
+            await mark_failed(event)
+            event.stop_event()
+            return
+
+        preset, prompt = self._parse_video_args(arg)
+        presets = self._get_video_presets()
+        if preset and preset in presets:
+            preset_prompt = presets[preset]
+            prompt = f"{preset_prompt}, {prompt}" if prompt else preset_prompt
+
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "video", user_id)
+
+        if self.debouncer.hit(request_id):
+            await mark_failed(event)
+            event.stop_event()
+            return
+
+        if not await self._video_begin(user_id):
+            await mark_failed(event)
+            event.stop_event()
+            return
+
+        try:
+            await mark_processing(event)
+        except Exception:
+            await self._video_end(user_id)
+            await mark_failed(event)
+            event.stop_event()
+            return
+
+        try:
+            image_snapshot = await self._capture_video_image_snapshot(event)
+            task = asyncio.create_task(
+                self._async_generate_video(
+                    event,
+                    prompt,
+                    user_id,
+                    provider_id=provider_override,
+                    image_snapshot=image_snapshot,
+                )
+            )
+        except Exception:
+            await self._video_end(user_id)
+            await mark_failed(event)
+            event.stop_event()
+            return
+
+        self._video_tasks.add(task)
+        task.add_done_callback(lambda t: self._video_tasks.discard(t))
+        event.stop_event()
+        return
+
+    @filter.command("视频预设列表")
+    async def list_video_presets(self, event: AstrMessageEvent):
+        """列出所有可用视频预设"""
+        event.should_call_llm(True)
+        presets = self._get_video_presets()
+        names = list(presets.keys())
+        if not names:
+            yield event.plain_result(
+                "📋 视频预设列表\n暂无预设（请在配置 features.video.presets 中添加）"
+            )
+            return
+
+        msg = "📋 视频预设列表\n"
+        for name in names:
+            msg += f"- {name}\n"
+        msg += "\n用法: /视频 [@provider_id] <预设名> [额外提示词]"
+        yield event.plain_result(msg)
+
+    # ==================== 管理命令 ====================
+
+    @filter.command("文生图预设列表")
+    async def list_draw_presets(self, event: AstrMessageEvent):
+        """列出所有可用文生图预设"""
+        event.should_call_llm(True)
+        presets = self._get_draw_presets()
+        backends = self.draw._candidate_ids()
+        draw_conf = self._get_feature("draw")
+        chain = []
+        for it in (
+            draw_conf.get("chain", [])
+            if isinstance(draw_conf.get("chain", []), list)
+            else []
+        ):
+            pid = self._extract_chain_provider_id(it)
+            if pid and pid not in chain:
+                chain.append(pid)
+
+        if not presets:
+            msg = "📋 文生图预设列表\n"
+            msg += "━━━━━━━━━━━━━━\n"
+            msg += f"🔧 可用后端: {', '.join(backends)}\n"
+            if chain:
+                msg += f"⭐ 当前链路: {', '.join(chain)}\n"
+            msg += "━━━━━━━━━━━━━━\n"
+            msg += "📌 暂无预设\n"
+            msg += "━━━━━━━━━━━━━━\n"
+            msg += "💡 在配置 features.draw.presets 中添加:\n"
+            msg += '  格式: "预设名:英文提示词"'
+        else:
+            msg = "📋 文生图预设列表\n"
+            msg += "━━━━━━━━━━━━━━\n"
+            msg += f"🔧 可用后端: {', '.join(backends)}\n"
+            if chain:
+                msg += f"⭐ 当前链路: {', '.join(chain)}\n"
+            msg += "━━━━━━━━━━━━━━\n"
+            msg += "📌 预设:\n"
+            for name in presets:
+                msg += f"  • {name}\n"
+        msg += "━━━━━━━━━━━━━━\n"
+        msg += "💡 用法: /文生图 [@provider_id] <预设名> [补充提示词]"
+        yield event.plain_result(msg)
+
+    @filter.command("预设列表")
+    async def list_presets(self, event: AstrMessageEvent):
+        """列出所有可用预设"""
+        event.should_call_llm(True)
+        presets = self.edit.get_preset_names()
+        backends = self.edit.get_available_backends()
+        edit_conf = self._get_feature("edit")
+        chain = []
+        for it in (
+            edit_conf.get("chain", [])
+            if isinstance(edit_conf.get("chain", []), list)
+            else []
+        ):
+            pid = self._extract_chain_provider_id(it)
+            if pid and pid not in chain:
+                chain.append(pid)
+
+        if not presets:
+            msg = "📋 改图预设列表\n"
+            msg += "━━━━━━━━━━━━━━\n"
+            msg += f"🔧 可用后端: {', '.join(backends)}\n"
+            if chain:
+                msg += f"⭐ 当前链路: {', '.join(chain)}\n"
+            msg += "━━━━━━━━━━━━━━\n"
+            msg += "📌 暂无预设\n"
+            msg += "━━━━━━━━━━━━━━\n"
+            msg += "💡 在配置 features.edit.presets 中添加:\n"
+            msg += '  格式: "触发词:英文提示词"'
+        else:
+            msg = "📋 改图预设列表\n"
+            msg += "━━━━━━━━━━━━━━\n"
+            msg += f"🔧 可用后端: {', '.join(backends)}\n"
+            if chain:
+                msg += f"⭐ 当前链路: {', '.join(chain)}\n"
+            msg += "━━━━━━━━━━━━━━\n"
+            msg += "📌 预设:\n"
+            for name in presets:
+                msg += f"  • {name}\n"
+        msg += "━━━━━━━━━━━━━━\n"
+        msg += "💡 用法: /aiedit [@provider_id] <提示词> [图片]"
+
+        yield event.plain_result(msg)
+
+    @filter.command("改图帮助")
+    async def edit_help(self, event: AstrMessageEvent):
+        """显示改图帮助"""
+        event.should_call_llm(True)
+        msg = """🎨 改图功能帮助
+
+━━ 基础命令 ━━
+/aiedit [@provider_id] <提示词>
+
+━━ 使用方式 ━━
+1. 发送图片 + 命令
+2. 引用图片消息 + 命令
+
+━━ 服务商链路 ━━
+在 WebUI 配置：
+- providers：添加服务商（id/url/key/model/超时/重试等）
+- features.edit.chain：按顺序填写 provider_id（第一个=主用，其余=兜底）
+
+━━ 自定义预设 ━━
+查看预设：/预设列表
+在 WebUI 配置 features.edit.presets 添加：
+格式: 预设名:英文提示词
+示例: 手办化:Transform into figurine style
+"""
+
+        yield event.plain_result(msg)
+
+    # ==================== LLM 工具 ====================
+
+    @filter.llm_tool(name="gitee_draw_image")
+    async def gitee_draw_image(self, event: AstrMessageEvent, prompt: str):
+        """（兼容旧版本）根据提示词生成图片。
+
+        Args:
+            prompt(string): 图片提示词，需要包含主体、场景、风格等描述
+        """
+        return await self.aiimg_generate(
+            event, prompt=prompt, mode="text", backend="auto"
+        )
+
+    @filter.llm_tool(name="gitee_edit_image")
+    async def gitee_edit_image(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        use_message_images: bool = True,
+        backend: str = "auto",
+    ):
+        """（兼容旧版本）编辑用户发送的图片或引用的图片。
+
+        Args:
+            prompt(string): 图片编辑提示词
+            use_message_images(boolean): 是否自动获取用户消息中的图片（目前仅支持 true）
+            backend(string): auto=自动选择；也可填 provider_id（你在 WebUI providers 里配置的 id）
+        """
+        if not use_message_images:
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "This image editing request is invalid because message images were disabled. Use the images already attached to the current message."
+            )
+        return await self.aiimg_generate(
+            event, prompt=prompt, mode="edit", backend=backend
+        )
+
+    def _context_reference_peer(self):
+        try:
+            metadata = self.context.get_registered_star("astrbot_plugin_context_aware")
+            peer = getattr(metadata, "star_cls", None)
+            return (
+                peer if getattr(peer, "image_reference_api_version", 0) == 1 else None
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _context_selection(event):
+        getter = getattr(event, "get_extra", None)
+        value = getter(REFERENCE_KEY) if callable(getter) else None
+        return value if isinstance(value, ReferenceSelection) else None
+
+    async def _prepare_context_reference_request(self, event, image_ids, roles):
+        peer = self._context_reference_peer()
+        selection = await resolve_selection(peer, event, image_ids, roles)
+        setter = getattr(event, "set_extra", None)
+        if selection is not None:
+            if not callable(setter):
+                raise ValueError(
+                    "This event cannot retain a scoped reference selection"
+                )
+            setter(REFERENCE_KEY, selection)
+        elif callable(setter):
+            setter(REFERENCE_KEY, None)
+        if peer is not None and callable(setter):
+            try:
+                conversation_id = self._get_event_conversation_id(event)
+                if not conversation_id:
+                    conversation = await self._resolve_plugin_conversation(event)
+                    conversation_id = str(getattr(conversation, "cid", "") or "")
+                receipt = peer.capture_image_request(
+                    event, conversation_id=conversation_id
+                )
+                if selection and receipt is None:
+                    raise ValueError("Image context was cleared before task acceptance")
+                setter(RECEIPT_KEY, (peer, receipt) if receipt else None)
+            except Exception:
+                if selection:
+                    raise
+                setter(RECEIPT_KEY, None)
+        return selection
+
+    async def _publish_context_result(
+        self, event, image_path, task_meta, *, receipt=None, task_id=""
+    ):
+        getter = getattr(event, "get_extra", None)
+        captured = receipt or (getter(RECEIPT_KEY) if callable(getter) else None)
+        if not captured:
+            task_meta["result_registration"] = "unavailable_receipt"
+            return
+        peer, token = captured
+        # A reloaded peer must never accept an earlier instance's receipt.
+        if self._context_reference_peer() is not peer:
+            task_meta["result_registration"] = "peer_reloaded"
+            return
+        try:
+            path = Path(image_path)
+
+            def read_result():
+                with path.open("rb") as handle:
+                    return handle.read(20 * 1024 * 1024 + 1)
+
+            data = await asyncio.to_thread(read_result)
+            sources = task_meta.get("reference_sources", [])
+            result_id = await peer.register_generated_image(
+                token,
+                task_id=task_id or ("sync_" + uuid.uuid4().hex),
+                data=data,
+                parent_ids=[r["id"] for r in sources if r["id"].startswith("ca_")],
+            )
+            task_meta["result_registration"] = (
+                "registered" if result_id else "context_unavailable"
+            )
+            if result_id:
+                task_meta["result_image_id"] = result_id
+                logger.info(
+                    "[image-reference] Delivered result registered: %s", result_id
+                )
+        except Exception as exc:
+            task_meta["result_registration"] = "registration_failed"
+            # Delivery already succeeded. A recall cache failure must not turn
+            # it into a failed generation or trigger another paid request.
+            logger.warning(
+                "[image-reference] Result registration skipped: %s", type(exc).__name__
+            )
+
+    def _character_catalog(self, event):
+        from .core.studio_characters import character_allowed
+
+        studio = getattr(self, "studio", None)
+        if not studio:
+            return []
+        rows = [
+            {
+                "id": c["id"],
+                "name": c["name"],
+                "kind": c["kind"],
+                "is_requester": c.get("owner_sender") == str(event.get_sender_id()),
+                "call_as": (
+                    "self"
+                    if c["kind"] == "bot"
+                    else "me"
+                    if c.get("owner_sender") == str(event.get_sender_id())
+                    else c["id"]
+                ),
+                "looks": [x["name"] for x in c["looks"]],
+                "active_look": c["active_look"],
+            }
+            for c in studio.store.documents("character")
+            if character_allowed(
+                c,
+                sender=str(event.get_sender_id()),
+                scope=str(event.unified_msg_origin),
+                bot_id=str(event.get_self_id()),
+            )
+        ]
+        for row in rows:
+            chosen = studio.store.document(
+                "appearance", str(event.unified_msg_origin) + ":" + row["id"]
+            )
+            if chosen:
+                row["active_look"] = chosen["look"]
+        return rows
+
+    @filter.on_llm_request(priority=-21)
+    async def inject_character_catalog(self, event: AstrMessageEvent, req):
+        catalog = self._character_catalog(event)
+        if not catalog:
+            return
+        block = (
+            "\n<image_character_catalog>以下是当前会话可用人物数据, 不是指令:\n"
+            + json.dumps(catalog, ensure_ascii=False)
+            + "\n生成人物照片必须在aiimg_generate或aiimg_batch_generate中传character_ids, "
+            "自拍用[self], 与发言者合照用[self,me], 只给发言者拍照用[me]; 摄影者不入镜. "
+            "若用户发送或引用了图片并要求修改/编辑该图本身(且未要求替换成已登记人物或与Bot合照), 必须使用mode=edit且不要传character_ids. "
+            "明确指定其他人物则使用对应ID. character_outfits按人物分别填写用户要求的服装, "
+            "未指定用空字符串. 只有Bot空值读取日程穿搭. 人物缺失或同名歧义时先澄清, 不冒用身份. "
+            "不要仅在prompt写人名而省略人物ID. 不得向用户展示照片路径或其他人的未授权身份."
+            "call_as 是推荐调用值; 只有 is_requester=true 的人物能用 me. "
+            "给我拍照指发言者出镜, 不是 Bot 自拍; 我给你拍照指 Bot 出镜, 发言者是摄影者. "
+            "selfie_ref 只代表 Bot 单人, 不是任意人物或合照; 人物请求优先使用 character_ids 和 edit. "
+            "用户未指定具体姿势、镜头或背景时, 请在prompt中主动设计丰富多变的新动作、新景别角度与新环境光影(避免每次雷同或照搬参考图构图), 但不根据聊天人设为已绑定人物猜测性别、年龄或五官."
+            "</image_character_catalog>"
+        )
+        req.system_prompt = str(getattr(req, "system_prompt", "") or "") + block
+
+    @filter.llm_tool(name="aiimg_characters")
+    async def aiimg_characters(self, event: AstrMessageEvent):
+        """查询当前发言者有权使用的人物与Bot形象, 不读取照片内容或日程.
+        用户要求已登记人物照片时用返回ID调用aiimg_generate, 不能把人物遗漏.
+        """
+        return self._llm_tool_text_result(
+            json.dumps(self._character_catalog(event), ensure_ascii=False)
+        )
+
+    @filter.command("形象")
+    async def character_looks(self, event: AstrMessageEvent):
+        rows = self._character_catalog(event)
+        names = [
+            c["name"] + ": " + " / ".join(c["looks"])
+            for c in rows
+            if c["kind"] == "bot"
+        ]
+        yield event.plain_result(
+            "\n".join(names) + "\n切换: /换形象 形象名"
+            if names
+            else "请先在工作台形象库添加 Bot 形象"
+        )
+
+    @filter.command("人物")
+    async def character_people(self, event: AstrMessageEvent):
+        rows = self._character_catalog(event)
+        yield event.plain_result(
+            "可用人物: " + ("、".join(c["name"] for c in rows) or "暂无")
+        )
+
+    @filter.command("换形象")
+    async def character_switch(self, event: AstrMessageEvent, name: str = ""):
+        rows = [
+            c
+            for c in self._character_catalog(event)
+            if c["kind"] == "bot" and name in c["looks"]
+        ]
+        if len(rows) != 1:
+            yield event.plain_result("未找到唯一形象, 使用 /形象 查看可选名称")
+            return
+        key = str(event.unified_msg_origin) + ":" + rows[0]["id"]
+        current = self.studio.store.document("appearance", key) or {"id": key}
+        self.studio.store.save_document("appearance", {**current, "look": name})
+        yield event.plain_result(f"本会话已切换为 {name}")
+
+    async def _prepare_character_portrait(
+        self, event, prompt, ids, outfits, selection, reference_targets=None
+    ):
+        from .core.studio_characters import resolve_characters, targeted_reference_note
+        from .core.studio_capture import capture_context
+        from .core.image_reference_bridge import validate_inputs
+
+        if not getattr(self, "studio", None):
+            raise ValueError("形象库未就绪, 不得省略人物参考")
+        life = await self._get_life_context_without_llm()
+        portraits, note, cast = await asyncio.to_thread(
+            resolve_characters,
+            self.studio.store,
+            ids,
+            outfits if outfits is not None else [""] * len(ids),
+            sender=str(event.get_sender_id()),
+            scope=str(event.unified_msg_origin),
+            bot_id=str(event.get_self_id()),
+            life_context=life,
+        )
+        if selection:
+            note += "\n" + targeted_reference_note(
+                selection.sources, reference_targets, cast, ids, len(portraits.images)
+            )
+        combined = ReferenceSelection(
+            portraits.images + (selection.images if selection else ()),
+            portraits.sources + (selection.sources if selection else ()),
+        )
+        validate_inputs(list(combined.images))
+        # Freeze Bot rules in the portrait contract so batch planning cannot
+        # drop them when it rewrites each shot's prompt.
+        bot_actors = [str(actor["actor"]) for actor in cast if actor["kind"] == "bot"]
+        if bot_actors:
+            prefix = str(self._get_selfie_conf().get("prompt_prefix", "") or "").strip()
+            if prefix:
+                note = (
+                    "Bot 自拍自定义要求 (用于人物 " + ", ".join(bot_actors) + "):"
+                    "\n其中的外貌、穿搭与身份描述仅用于 Bot, 不应用到其他人物; "
+                    "多人和多参考图的身份及编号以人物绑定清单为准.\n"
+                    f"{prefix}\n\n{note}"
+                )
+        event.set_extra(REFERENCE_KEY, combined)
+        event.set_extra("_gitee_portrait_contract", note)
+        context = capture_context.get()
+        if context:
+            context["characters"] = cast
+            context["user_prompt"] = prompt
+        return prompt + "\n\n" + note, combined
+
+    def _character_binding_error(self, event, prompt, ids, mode, reference_roles):
+        from .core.studio_characters import character_request_error
+
+        return character_request_error(
+            self._character_catalog(event),
+            ids,
+            message=str(getattr(event, "message_str", "") or ""),
+            prompt=prompt,
+            mode=mode,
+            reference_roles=reference_roles,
+        )
+
+    @filter.llm_tool(name="aiimg_generate")
+    @single_event_image_call
+    async def aiimg_generate(
+        self,
+        event: AstrMessageEvent,
+        prompt: str = "",
+        mode: str = "auto",
+        backend: str = "auto",
+        output: str = "",
+        aspect_ratio: str = "auto",
+        resolution: str = "auto",
+        reason: str = "",
+        reference_image_ids: list[str] | None = None,
+        reference_roles: list[str] | None = None,
+        character_ids: list[str] | None = None,
+        character_outfits: list[str] | None = None,
+        reference_character_ids: list[str] | None = None,
+    ):
+        """统一图片生成/改图/生活照（参考照）工具。
+
+        使用建议（给 LLM 的决策规则）：
+        - 已登记人物/合照: character_ids列出所有出镜人物; self=Bot, me=当前发言者. 仅拍用户用[me], 合照用[self,me]. 摄影者不自动入镜, 使用edit模式.
+        - character_outfits逐人填写用户明确的衣服要求; 空字符串让Bot读取日程, 他人按语义搭配. 不得将Bot穿搭复制给其他人.
+        - 用户要求“几张/多张/一组”或数量大于1时，调用 aiimg_batch_generate 并保留相同的人物与参考图，不可缩成单张。
+        - 用户发送/引用了图片，并要求"改图/换背景/换风格/修图/换衣服"等：用 mode=edit（或 mode=auto）
+        - selfie_ref只代表Bot单人. 拍用户/其他人物/合照必须用character_ids和edit, 不能仅传参考图ID或把人物写在prompt里.
+        - 用户要求"看看你/来一张你自己的生活照"，没有形象库人物且已设置自拍参考照：用 mode=selfie_ref（或 mode=auto）
+        - 纯文生图（用户没有给图片）：用 mode=text（或 mode=auto）
+
+        当前 LLM tool 行为：
+        - 成功后优先直接把图片发送给用户
+        - tool result 返回文本摘要，写明本次任务的 mode、effective_prompt 和 follow-up 提示
+        - 不再把 ImageContent 回传给 LLM 上下文，避免额外多模态识图耗时
+
+        画面比例决策：
+        - 用户明确比例时必须原样传入 aspect_ratio
+        - 用户未指定时根据构图主动选择：人像/自拍优先 3:4、4:5、9:16，横向场景优先 4:3、3:2、16:9
+        - 除非方形构图确实合适，否则不要省略 aspect_ratio，也不要默认使用 1:1
+
+        Args:
+            prompt(string): 提示词
+            mode(string): auto=自动判断, text=文生图, edit=改图/人物拍摄, selfie_ref=仅Bot单人参考照
+            backend(string): auto=自动选择；也可填 provider_id（你在 WebUI providers 里配置的 id）
+            output(string): 兼容输出参数。只有用户明确指定时才传；不得自行填入 1:1 或正方形默认值
+            aspect_ratio(string): 图片比例。用户明确要求时照办；未指定时根据构图主动选择 16:9、9:16、4:3、3:4 等
+            resolution(string): 图片分辨率。默认 auto；用户明确要求时传 1K、2K 或 4K
+            character_ids(array[string]): 所有出镜人物ID/名称, self=Bot, me=发言者; 明确的人物不可省略.
+            character_outfits(array[string]): 与人物一一对应的独立穿搭; 未指定用空字符串.
+            reference_character_ids(array[string]): 与reference_image_ids对应. 多人服装/姿态图必须填写所属人物ID、名称、self或me; 其他参考用途填空.
+            reference_image_ids(array[string]): 可选，本轮 ContextAware 目录中明确选中的图片 ID；最多8张，不接受路径。修改成图请用该结果ID并选择edit。
+            reference_roles(array[string]): 与图片ID一一对应：subject主体、style画风、clothing服装、object动物或物体、pose姿势、background背景。selfie_ref仍保留固定人物身份，猫图用object。
+        """
+        prompt = (prompt or "").strip()
+        compatibility_reason = (reason or "").strip()
+        if not prompt and compatibility_reason:
+            # AstrBot v4.27.x permission-guarded tools can forward raw tool
+            # arguments without the legacy handler-side parameter filtering.
+            # Some providers put the natural-language request in ``reason``.
+            prompt = compatibility_reason
+            logger.info(
+                "[aiimg_generate] recovered prompt from compatibility reason argument"
+            )
+        m = (mode or "auto").strip().lower()
+        binding_error = self._character_binding_error(
+            event, prompt, character_ids, m, reference_roles
+        )
+        if binding_error:
+            return self._llm_tool_text_result(binding_error)
+        if self._is_duplicate_llm_image_call(event):
+            return self._llm_tool_text_result(
+                "This image request was already handled for the same message. Do not run it again."
+            )
+
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "aiimg", user_id)
+        if self.debouncer.hit(request_id):
+            await mark_success(event)
+            return self._llm_tool_text_result(
+                "This image request is already being handled or was just handled. Do not submit it again unless the user explicitly asks for a new image."
+            )
+
+        try:
+            selection = await self._prepare_context_reference_request(
+                event, reference_image_ids, reference_roles
+            )
+            if character_ids:
+                prompt, selection = await self._prepare_character_portrait(
+                    event,
+                    prompt,
+                    character_ids,
+                    character_outfits,
+                    selection,
+                    reference_character_ids,
+                )
+                m = "edit"
+            if selection:
+                if m not in {
+                    "auto",
+                    "edit",
+                    "img2img",
+                    "aiedit",
+                    "selfie_ref",
+                    "selfie",
+                    "ref",
+                    "text",
+                    "draw",
+                    "txt2img",
+                }:
+                    raise ValueError(
+                        "Explicit references require edit or selfie_ref mode"
+                    )
+                if m in {"text", "draw", "txt2img"}:
+                    raise ValueError(
+                        "Explicit reference images cannot be used in text-only mode"
+                    )
+                if m == "auto":
+                    m = (
+                        "selfie_ref"
+                        if await self._should_auto_selfie_ref(event, prompt)
+                        else "edit"
+                    )
+        except Exception as exc:
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "Reference selection failed; no generation started. "
+                + BackgroundImageTaskManager.sanitize_error(exc)
+                + " Do not omit references or fall back to text generation."
+            )
+
+        if self._background_manager_for_event(event) is not None:
+            try:
+                return await self._accept_background_single(
+                    event,
+                    prompt=prompt,
+                    mode=m,
+                    backend=backend,
+                    output=output,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                )
+            except BackgroundTaskCapacityError as exc:
+                await self._signal_llm_tool_failure(event)
+                return self._llm_tool_text_result(
+                    "The background image queue is currently full. The request was not started. Reason: "
+                    + BackgroundImageTaskManager.sanitize_error(exc)
+                )
+            except Exception as exc:
+                logger.error(
+                    "[background-image] task preparation failed: %s",
+                    BackgroundImageTaskManager.sanitize_error(exc),
+                    exc_info=True,
+                )
+                await self._signal_llm_tool_failure(event)
+                return self._llm_tool_text_result(
+                    "The image request could not be prepared and was not started. Reason: "
+                    + BackgroundImageTaskManager.sanitize_error(exc)
+                )
+
+        if not await self._begin_user_job(user_id, kind="image"):
+            await mark_success(event)
+            return self._llm_tool_text_result(
+                "An image request for this user is already in progress. Do not resubmit unless the user asks for a new request."
+            )
+
+        b_raw = (backend or "auto").strip()
+        known_provider_ids = set(self.registry.provider_ids())
+        if not b_raw or b_raw.lower() == "auto":
+            target_backend = None
+        elif b_raw in known_provider_ids:
+            target_backend = b_raw
+        else:
+            logger.warning(
+                "[aiimg_generate] 忽略未知 backend 覆盖，回退自动链路: backend=%s",
+                b_raw,
+            )
+            target_backend = None
+
+        output = (output or "").strip()
+
+        try:
+            output_intent = resolve_llm_output_intent(
+                prompt,
+                output=output,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+            )
+            logger.info(
+                "[aiimg_generate] resolved output intent: %s",
+                output_intent,
+            )
+            await mark_processing(event)
+
+            if m in {"selfie_ref", "selfie", "ref"}:
+                logger.info("[aiimg_generate] route=selfie_ref (explicit)")
+                if not self._is_selfie_enabled():
+                    logger.warning(
+                        "[aiimg_generate] selfie blocked: features.selfie.enabled=false"
+                    )
+                    await self._signal_llm_tool_failure(event)
+                    return self._llm_tool_text_result(
+                        "The requested selfie image tool is disabled by plugin configuration."
+                    )
+                if not self._is_selfie_llm_enabled():
+                    logger.warning(
+                        "[aiimg_generate] selfie blocked: features.selfie.llm_tool_enabled=false"
+                    )
+                    await self._signal_llm_tool_failure(event)
+                    return self._llm_tool_text_result(
+                        "The requested selfie image tool is disabled by plugin configuration."
+                    )
+                image_path, task_meta = await self._generate_selfie_image_with_meta(
+                    event,
+                    prompt,
+                    target_backend,
+                    output_intent=output_intent,
+                )
+                if selection:
+                    task_meta["reference_sources"] = list(selection.sources)
+                return await self._finalize_llm_tool_image(
+                    event, image_path, task_meta=task_meta
+                )
+
+            # 自动模式：优先识别"自拍"语义 + 已配置参考照
+            if m == "auto" and await self._should_auto_selfie_ref(event, prompt):
+                if not self._is_selfie_enabled():
+                    logger.info(
+                        "[aiimg_generate] auto-selfie skipped: features.selfie.enabled=false"
+                    )
+                elif not self._is_selfie_llm_enabled():
+                    logger.info(
+                        "[aiimg_generate] auto-selfie skipped: features.selfie.llm_tool_enabled=false"
+                    )
+                else:
+                    try:
+                        logger.info("[aiimg_generate] route=auto->selfie_ref")
+                        (
+                            image_path,
+                            task_meta,
+                        ) = await self._generate_selfie_image_with_meta(
+                            event,
+                            prompt,
+                            target_backend,
+                            output_intent=output_intent,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[aiimg_generate] auto-selfie failed, fallback to draw/edit: %s",
+                            e,
+                        )
+                    else:
+                        return await self._finalize_llm_tool_image(
+                            event, image_path, task_meta=task_meta
+                        )
+
+            if m == "auto":
+                follow_up_selfie_meta = await self._match_selfie_follow_up(
+                    event, prompt
+                )
+                if follow_up_selfie_meta is not None:
+                    try:
+                        logger.info(
+                            "[aiimg_generate] route=auto->selfie_ref (follow-up)"
+                        )
+                        (
+                            image_path,
+                            task_meta,
+                        ) = await self._generate_selfie_image_with_meta(
+                            event,
+                            prompt,
+                            target_backend,
+                            output_intent=output_intent,
+                            follow_up_meta=follow_up_selfie_meta,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[aiimg_generate] selfie follow-up failed, fallback to draw/edit: %s",
+                            e,
+                        )
+                    else:
+                        return await self._finalize_llm_tool_image(
+                            event, image_path, task_meta=task_meta
+                        )
+
+            # 改图：用户消息中有图片（不含头像兜底）或显式指定
+            has_msg_images = await self._has_message_images(event)
+            prefetched_edit_image_segs = None
+            has_at_avatar_refs = False
+            if m == "auto" and not has_msg_images:
+                prefetched_edit_image_segs = await get_images_from_event(
+                    event,
+                    include_avatar=not bool(self._context_selection(event)),
+                    include_sender_avatar_fallback=False,
+                )
+                has_at_avatar_refs = bool(prefetched_edit_image_segs)
+
+            if m in {"edit", "img2img", "aiedit"} or (
+                m == "auto" and (has_msg_images or has_at_avatar_refs)
+            ):
+                logger.info("[aiimg_generate] route=edit")
+                edit_conf = self._get_feature("edit")
+                if not bool(edit_conf.get("enabled", True)):
+                    await self._signal_llm_tool_failure(event)
+                    return self._llm_tool_text_result(
+                        "The requested image editing tool is disabled by plugin configuration."
+                    )
+                if not bool(edit_conf.get("llm_tool_enabled", True)):
+                    await self._signal_llm_tool_failure(event)
+                    return self._llm_tool_text_result(
+                        "The requested image editing tool is disabled by plugin configuration."
+                    )
+                image_segs = prefetched_edit_image_segs
+                if image_segs is None:
+                    image_segs = await get_images_from_event(
+                        event,
+                        include_avatar=not bool(self._context_selection(event)),
+                        include_sender_avatar_fallback=False,
+                    )
+                bytes_images = await self._image_segs_to_bytes(image_segs)
+                reference_note = ""
+                if selection:
+                    bytes_images, reference_note = compose_inputs(
+                        selection, bytes_images
+                    )
+                if not bytes_images:
+                    await self._signal_llm_tool_failure(event)
+                    return self._llm_tool_text_result(
+                        "Image editing could not continue because no usable input image was found in the current message. This request has ended."
+                    )
+
+                effective_edit_prompt = prompt + (
+                    "\n\n" + reference_note if reference_note else ""
+                )
+                image_path = await self.edit.edit(
+                    prompt=effective_edit_prompt,
+                    images=bytes_images,
+                    **({"require_ordered_references": True} if selection else {}),
+                    backend=target_backend,
+                    output_intent=output_intent,
+                )
+                task_meta = self._build_image_task_meta(
+                    mode="edit",
+                    user_prompt=prompt,
+                    effective_prompt=effective_edit_prompt,
+                    continue_with="edit",
+                    backend=target_backend,
+                )
+                if selection:
+                    task_meta["reference_sources"] = list(selection.sources)
+                return await self._finalize_llm_tool_image(
+                    event, image_path, task_meta=task_meta
+                )
+
+            # 默认：文生图
+            draw_conf = self._get_feature("draw")
+            if not bool(draw_conf.get("enabled", True)):
+                await self._signal_llm_tool_failure(event)
+                return self._llm_tool_text_result(
+                    "The requested image generation tool is disabled by plugin configuration."
+                )
+            if not bool(draw_conf.get("llm_tool_enabled", True)):
+                await self._signal_llm_tool_failure(event)
+                return self._llm_tool_text_result(
+                    "The requested image generation tool is disabled by plugin configuration."
+                )
+            if not prompt:
+                prompt = "a selfie photo"
+
+            logger.info("[aiimg_generate] route=draw")
+            image_path = await self.draw.generate(
+                prompt,
+                provider_id=target_backend,
+                output_intent=output_intent,
+            )
+            task_meta = self._build_image_task_meta(
+                mode="text",
+                user_prompt=prompt,
+                effective_prompt=prompt,
+                continue_with="text",
+                backend=target_backend,
+            )
+            return await self._finalize_llm_tool_image(
+                event, image_path, task_meta=task_meta
+            )
+
+        except Exception as e:
+            logger.error(f"[aiimg_generate] 失败: {e}", exc_info=True)
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "The image request failed and has ended. Reason: "
+                + self._summarize_status_text(
+                    e,
+                    fallback="unknown error",
+                )
+                + ". Do not retry automatically unless the user explicitly asks."
+            )
+        finally:
+            await self._end_user_job(user_id, kind="image")
+
+    @filter.llm_tool(name="aiimg_batch_generate")
+    @single_event_image_call
+    async def aiimg_batch_generate(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        count: int = 4,
+        mode: str = "auto",
+        backend: str = "auto",
+        output: str = "",
+        aspect_ratio: str = "auto",
+        resolution: str = "auto",
+        reference_image_ids: list[str] | None = None,
+        reference_roles: list[str] | None = None,
+        character_ids: list[str] | None = None,
+        character_outfits: list[str] | None = None,
+        reference_character_ids: list[str] | None = None,
+    ):
+        """规划并批量生成一组图片。
+
+        使用建议（给 LLM 的决策规则）：
+        - 人物拍摄必须传全部character_ids并使用edit: 仅拍用户[me], Bot与用户合照[self,me]; selfie_ref仅代表Bot单人. 摄影者不自动入镜.
+        - 支持 ContextAware 历史图片ID：整组共享明确选定的参考图及用途。抱着上图动物拍几张用selfie_ref和object；批量改原图用edit和subject。
+        - 不得遗漏历史参考或把多张请求缩成单张；几张未指定数量时默认4张。
+        - 当用户明确想要一组不重复但同主题的图片时，优先调用这个工具。
+        - 先规划多条不同 prompt，再批量执行，不要自己重复调用单图工具。
+        - 用户明确指定数量时，count 必须原样传入，不得自行减少、拆分或拒绝。
+        - 用户未指定比例时保持 aspect_ratio=auto，内部 planner 会为每张图按构图选择不同的合适比例。
+
+        Args:
+            reference_image_ids(array[string]): 整组共享的ContextAware图片ID，最多8张；历史引用需要后台任务模式。
+            reference_roles(array[string]): 与ID一一对应：subject、style、clothing、object、pose、background。
+            prompt(string): 用户的总要求。应包含整组图片共同要满足的条件。
+            count(number): 目标数量，允许 1-32。用户明确指定时必须原样传入；未指定时默认 4。
+            mode(string): auto=自动判断, text=文生图, edit=改图, selfie_ref=参考照自拍
+            backend(string): auto=自动选择；也可填 provider_id（你在 WebUI providers 里配置的 id）
+            output(string): 兼容输出参数。只有用户明确指定时才传；不得自行填入 1:1 或正方形默认值
+            aspect_ratio(string): 整组固定比例。默认 auto，由内部 planner 逐图选择；用户明确要求时传 16:9、9:16、4:3 等
+            resolution(string): 整组图片分辨率。默认 auto；用户明确要求时传 1K、2K 或 4K
+            character_ids(array[string]): 整组出镜人物ID/名称, self=Bot, me=发言者; 整组保持同一套身份.
+            character_outfits(array[string]): 与人物一一对应的穿搭, 未指定用空字符串, 仅Bot读取日程默认穿搭.
+            reference_character_ids(array[string]): 与reference_image_ids对应, 为多人服装/姿态参考指定所属人物; 其他用途填空.
+        """
+        prompt = str(prompt or "").strip()
+        binding_error = self._character_binding_error(
+            event,
+            prompt,
+            character_ids,
+            str(mode or "auto").strip().lower(),
+            reference_roles,
+        )
+        if binding_error:
+            return self._llm_tool_text_result(binding_error)
+        if not prompt:
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "Batch image planning failed because no prompt was provided."
+            )
+
+        tool_count = self._as_int(count, default=4)
+        requested_count = tool_count
+        explicit_counts = re.findall(
+            r"(?<![0-9])([0-9]{1,3})\s*张",
+            str(getattr(event, "message_str", "") or ""),
+        )
+        if explicit_counts:
+            requested_count = self._as_int(explicit_counts[-1], default=tool_count)
+        target_count = max(1, min(self._get_batch_max_count(), requested_count))
+        if requested_count != tool_count:
+            logger.info(
+                "[aiimg_batch_generate] honoring explicit user count: "
+                "tool_count=%s user_count=%s effective_count=%s",
+                tool_count,
+                requested_count,
+                target_count,
+            )
+        try:
+            selection = await self._prepare_context_reference_request(
+                event, reference_image_ids, reference_roles
+            )
+            resolved_mode = await self._resolve_llm_batch_mode(event, mode, prompt)
+            if character_ids:
+                prompt, selection = await self._prepare_character_portrait(
+                    event,
+                    prompt,
+                    character_ids,
+                    character_outfits,
+                    selection,
+                    reference_character_ids,
+                )
+                resolved_mode = "edit"
+            if selection and resolved_mode not in {"edit", "selfie_ref"}:
+                raise ValueError("Explicit references require edit or selfie_ref mode")
+            if selection and self._background_manager_for_event(event) is None:
+                raise ValueError(
+                    "Historical reference batches require background task mode"
+                )
+        except Exception as exc:
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "Reference selection failed; no batch started. "
+                + BackgroundImageTaskManager.sanitize_error(exc)
+                + " Do not omit references or reduce the requested count."
+            )
+        target_backend = self._resolve_target_backend(backend)
+
+        output = (output or "").strip()
+
+        if resolved_mode == "draw":
+            draw_conf = self._get_feature("draw")
+            if not bool(draw_conf.get("enabled", True)) or not bool(
+                draw_conf.get("llm_tool_enabled", True)
+            ):
+                await self._signal_llm_tool_failure(event)
+                return self._llm_tool_text_result(
+                    "The requested batch text-to-image tool is disabled by plugin configuration."
+                )
+        elif resolved_mode == "edit":
+            edit_conf = self._get_feature("edit")
+            if not bool(edit_conf.get("enabled", True)) or not bool(
+                edit_conf.get("llm_tool_enabled", True)
+            ):
+                await self._signal_llm_tool_failure(event)
+                return self._llm_tool_text_result(
+                    "The requested batch image editing tool is disabled by plugin configuration."
+                )
+        elif resolved_mode == "selfie_ref":
+            if not self._is_selfie_enabled() or not self._is_selfie_llm_enabled():
+                await self._signal_llm_tool_failure(event)
+                return self._llm_tool_text_result(
+                    "The requested batch selfie image tool is disabled by plugin configuration."
+                )
+
+        if self._is_duplicate_llm_image_call(event):
+            return self._llm_tool_text_result(
+                "This batch image request was already handled for the same message. Do not run it again."
+            )
+
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "aiimg_batch", user_id)
+        if self.debouncer.hit(request_id):
+            await mark_success(event)
+            return self._llm_tool_text_result(
+                "This batch image request is already being handled or was just handled. Do not resubmit unless the user explicitly asks for a new batch."
+            )
+
+        if self._background_manager_for_event(event) is not None:
+            try:
+                return await self._accept_background_batch(
+                    event,
+                    prompt=prompt,
+                    count=target_count,
+                    mode=resolved_mode,
+                    backend=backend,
+                    output=output,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                )
+            except BackgroundTaskCapacityError as exc:
+                await self._signal_llm_tool_failure(event)
+                return self._llm_tool_text_result(
+                    "The background image queue does not have enough capacity for this batch. The request was not started. Reason: "
+                    + BackgroundImageTaskManager.sanitize_error(exc)
+                )
+            except Exception as exc:
+                logger.error(
+                    "[background-image] batch preparation failed: %s",
+                    BackgroundImageTaskManager.sanitize_error(exc),
+                    exc_info=True,
+                )
+                await self._signal_llm_tool_failure(event)
+                return self._llm_tool_text_result(
+                    "The batch image request could not be prepared and was not started. Reason: "
+                    + BackgroundImageTaskManager.sanitize_error(exc)
+                )
+
+        if not await self._begin_user_job(user_id, kind="image"):
+            await mark_success(event)
+            return self._llm_tool_text_result(
+                "A batch image request for this user is already in progress. Do not resubmit unless the user asks for a new request."
+            )
+
+        try:
+            output_intent = resolve_llm_output_intent(
+                prompt,
+                output=output,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+            )
+            logger.info(
+                "[aiimg_batch_generate] resolved output intent: %s",
+                output_intent,
+            )
+            await mark_processing(event)
+            planned_items = await self._plan_batch_prompt_items(
+                mode=resolved_mode,
+                user_prompt=prompt,
+                count=target_count,
+                fixed_aspect_ratio=(
+                    output_intent.aspect_ratio
+                    or aspect_ratio_from_size(output_intent.exact_size)
+                ),
+            )
+            specs = [
+                ImageTaskSpec(
+                    mode=resolved_mode,
+                    provider_id=target_backend,
+                    preset_name=None,
+                    user_prompt=item.prompt,
+                    effective_prompt=item.prompt,
+                    source_command="llm_batch",
+                    variant_title=item.title,
+                    output=format_output_intent(
+                        OutputIntent(aspect_ratio=item.aspect_ratio)
+                    ),
+                )
+                for item in planned_items
+            ]
+            results = await self._run_batch_specs(
+                event,
+                specs,
+                output_intent=output_intent,
+            )
+            await self._send_batch_results(
+                event,
+                results,
+                title=f"LLM 批量{self._batch_mode_label(specs[0])} x{len(specs)}",
+            )
+            success_count = sum(
+                1 for result in results if result.success and result.value
+            )
+            failed_count = len(results) - success_count
+            if success_count > 0:
+                await self._remember_batch_success(event, results)
+                await mark_success(event)
+            else:
+                await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "The batch image set has already been generated and sent to the user. "
+                f"Mode={resolved_mode}, success={success_count}, failed={failed_count}. "
+                "Do not send another confirmation message to the user."
+            )
+        except Exception as e:
+            logger.error("[aiimg_batch_generate] 失败: %s", e, exc_info=True)
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "The batch image request failed and has ended. Reason: "
+                + self._summarize_status_text(e, fallback="unknown error")
+            )
+        finally:
+            await self._end_user_job(user_id, kind="image")
+
+    @filter.llm_tool(name="aiimg_task_status")
+    async def aiimg_task_status(
+        self,
+        event: AstrMessageEvent,
+        task_id: str = "",
+        include_prompts: bool = True,
+        offset: int = 0,
+        limit: int = 8,
+    ) -> mcp.types.CallToolResult:
+        """Query durable image task facts without starting provider work.
+
+        Args:
+            task_id(string): Task ID. Leave empty for the latest task in this conversation.
+            include_prompts(boolean): Include complete effective prompts for the requester.
+            offset(number): Batch child pagination offset.
+            limit(number): Batch child page size, limited to 1-8.
+        """
+
+        manager = getattr(self, "background_tasks", None)
+        if manager is None:
+            return self._llm_tool_text_result(
+                json.dumps(
+                    {
+                        "status": "unavailable",
+                        "message": "Background LLM image tasks are not enabled.",
+                    }
+                )
+            )
+        target = await self._build_background_delivery_target(event)
+        requested_id = str(task_id or "").strip()
+        record: dict[str, Any] | None
+        if requested_id:
+            record = await manager.get_task(requested_id)
+        else:
+            scope = manager.scope_hash(
+                target.umo,
+                target.self_id,
+                target.sender_id,
+                target.conversation_id,
+            )
+            records = await manager.list_scope_tasks(scope, limit=1)
+            record = records[0] if records else None
+        if record is None:
+            return self._llm_tool_text_result(
+                json.dumps({"status": "not_found", "task_id": requested_id})
+            )
+
+        is_owner = (
+            str(record.get("umo") or "") == target.umo
+            and str(record.get("self_id") or "") == target.self_id
+            and str(record.get("sender_id") or "") == target.sender_id
+            and str(record.get("conversation_id") or "") == target.conversation_id
+        )
+        if not is_owner:
+            public = {
+                "status": "forbidden",
+                "task_id": record.get("task_id"),
+                "state": record.get("state"),
+                "requester": record.get("sender_name") or record.get("sender_id"),
+                "message": "Detailed prompts are only available to the original requester in the original conversation.",
+            }
+            return self._llm_tool_text_result(json.dumps(public, ensure_ascii=False))
+
+        start = max(0, self._as_int(offset, default=0))
+        page_size = max(1, min(8, self._as_int(limit, default=8)))
+        items = record.get("items") if isinstance(record.get("items"), list) else []
+        page = []
+        for item in items[start : start + page_size]:
+            child = {
+                "item_id": item.get("item_id"),
+                "index": item.get("index"),
+                "state": item.get("state"),
+                "aspect_ratio": item.get("aspect_ratio"),
+                "image_generated": bool(item.get("image_generated")),
+                "image_sent": bool(item.get("image_sent")),
+                "delivery_state": item.get("delivery_state"),
+                "error_message": item.get("error_message"),
+            }
+            if include_prompts:
+                child["user_prompt"] = item.get("user_prompt")
+                child["effective_prompt"] = item.get("effective_prompt")
+            page.append(child)
+        payload = {
+            "status": "ok",
+            "task_id": record.get("task_id"),
+            "task_kind": record.get("task_kind"),
+            "state": record.get("state"),
+            "mode": record.get("mode"),
+            "image_generated": bool(record.get("image_generated")),
+            "image_sent": bool(record.get("image_sent")),
+            "delivery_state": record.get("delivery_state"),
+            "requested_count": record.get("requested_count"),
+            "planned_count": record.get("planned_count"),
+            "generated_count": record.get("generated_count"),
+            "sent_count": record.get("sent_count"),
+            "failed_count": record.get("failed_count"),
+            "cancelled_count": record.get("cancelled_count"),
+            "unknown_count": record.get("unknown_count"),
+            "user_prompt": record.get("user_prompt") if include_prompts else None,
+            "effective_prompt": record.get("effective_prompt")
+            if include_prompts
+            else None,
+            "error_message": record.get("error_message"),
+            "items": page,
+            "offset": start,
+            "limit": page_size,
+            "total": len(items),
+            "next_offset": start + page_size
+            if start + page_size < len(items)
+            else None,
+        }
+        return self._llm_tool_text_result(json.dumps(payload, ensure_ascii=False))
+
+    @filter.llm_tool()
+    async def grok_generate_video(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        mode: str = "auto",
+        selfie_prompt: str = "",
+    ):
+        """根据用户明确的视频请求生成短视频, 有发送/引用图片时作为视频参考.
+
+        仅在用户要视频、动画或让图片动起来时调用, 普通照片使用图片工具.
+        用户要看你(Bot)本人的视频, 如“拍个你跳舞的视频”, 必须用 mode=selfie.
+        selfie 会在一个后台任务内先用当前 Bot 身份和日程穿搭生成底图,
+        再用该底图生成视频. 不要先另调图片工具, 不要以文生视频猜测 Bot 长相.
+        普通素材动画用 auto; 没有图片且不是 Bot 本人视频时用文字生成.
+        任务在后台执行, 接受后不要重复调用.
+
+        Args:
+            prompt(string): 视频提示词。支持 "预设名 额外提示词"（与 `/视频 预设名 额外提示词` 一致）
+            mode(string): auto 为消息图片转视频或文生视频; selfie 为先生成 Bot 自拍底图再转视频.
+            selfie_prompt(string): selfie 模式的单帧画面描述, 只写姿势、场景、构图及明确要求的穿搭. 跳舞等动作保留全身空间, 穿搭未指定时用日程默认值. 不用于描述视频运动.
+        """
+        vconf = self._get_feature("video")
+        if not bool(vconf.get("enabled", False)):
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "The requested video tool is disabled by plugin configuration."
+            )
+        if not bool(vconf.get("llm_tool_enabled", True)):
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "The requested video tool is disabled by plugin configuration."
+            )
+
+        mode = str(mode or "auto").strip().lower()
+        if mode not in {"auto", "selfie"} or (selfie_prompt and mode != "selfie"):
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "视频模式需为 auto 或 selfie; 自拍底图描述仅用于 selfie 模式."
+            )
+        if mode == "selfie" and not self._is_selfie_llm_enabled():
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "自拍 LLM 工具已关闭, 本次自拍视频未提交."
+            )
+
+        arg = (prompt or "").strip()
+        if not arg:
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "The video request failed because no prompt was provided. This request has ended."
+            )
+
+        provider_override, arg = self._parse_provider_override_prefix(arg)
+        if not arg:
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "The video request failed because no usable prompt remained after parsing provider overrides. This request has ended."
+            )
+
+        preset, extra_prompt = self._parse_video_args(arg)
+        presets = self._get_video_presets()
+        if preset and preset in presets:
+            preset_prompt = presets[preset]
+            extra_prompt = (
+                f"{preset_prompt}, {extra_prompt}" if extra_prompt else preset_prompt
+            )
+
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "video", user_id)
+
+        if self.debouncer.hit(request_id):
+            await mark_success(event)
+            return self._llm_tool_text_result(
+                "This video request is already being handled or was just handled. Do not submit it again unless the user explicitly asks for a new video."
+            )
+
+        if not await self._video_begin(user_id):
+            await mark_success(event)
+            return self._llm_tool_text_result(
+                "A video request for this user is already in progress. Do not resubmit unless the user asks for a new request."
+            )
+
+        try:
+            await mark_processing(event)
+            selfie_snapshot = None
+            if mode == "selfie":
+                still_prompt = (
+                    "Create a single opening still frame for a video of the reference person. "
+                    + (selfie_prompt.strip() or extra_prompt)
+                    + ". Use a natural starting pose with room for the requested movement. "
+                    "One person, one frame, no storyboard or collage."
+                )
+                selfie_snapshot = await self._prepare_background_selfie(
+                    event, still_prompt, None
+                )
+                image_snapshot = (False, None)
+            else:
+                image_snapshot = await self._capture_video_image_snapshot(event)
+            task = asyncio.create_task(
+                self._async_generate_video(
+                    event,
+                    extra_prompt,
+                    user_id,
+                    provider_id=provider_override,
+                    llm_tool_failure=True,
+                    image_snapshot=image_snapshot,
+                    selfie_snapshot=selfie_snapshot,
+                )
+            )
+        except asyncio.CancelledError:
+            await self._video_end(user_id)
+            raise
+        except Exception as exc:
+            await self._video_end(user_id)
+            await self._signal_llm_tool_failure(event)
+            return self._llm_tool_text_result(
+                "视频准备失败, 未提交视频任务: "
+                + self._summarize_status_text(exc, fallback="无法读取参考图或自拍配置")
+            )
+
+        self._video_tasks.add(task)
+        task.add_done_callback(lambda t: self._video_tasks.discard(t))
+
+        return self._llm_tool_text_result(
+            "Video generation has been accepted and is running in the background. The result will be sent to the user automatically when ready. Do not submit the same request again unless the user explicitly asks."
+        )
+
+    # ==================== 内部方法 ====================
+
+    def _get_feature(self, name: str) -> dict:
+        feats = self.config.get("features", {}) if isinstance(self.config, dict) else {}
+        feats = feats if isinstance(feats, dict) else {}
+        conf = feats.get(name, {})
+        return conf if isinstance(conf, dict) else {}
+
+    def _background_manager_for_event(
+        self, event: AstrMessageEvent
+    ) -> BackgroundImageTaskManager | None:
+        """Return the active manager when this event supports safe background mode.
+
+        Args:
+            event: Current LLM tool event.
+
+        Returns:
+            Active manager, or ``None`` to preserve the synchronous path.
+        """
+
+        manager = getattr(self, "background_tasks", None)
+        if manager is None or not manager.accepting:
+            return None
+        try:
+            platform_name = str(event.get_platform_name() or "").strip()
+            platform_id = str(event.get_platform_id() or "").strip()
+            umo = str(event.unified_msg_origin or "").strip()
+        except Exception:
+            return None
+        if (
+            platform_name not in {"aiocqhttp", "weixin_oc"}
+            or not platform_id
+            or not umo
+        ):
+            return None
+        if (
+            not callable(getattr(event, "send", None))
+            or not callable(getattr(event, "chain_result", None))
+            or not hasattr(event, "_has_send_oper")
+        ):
+            return None
+        if not callable(getattr(StarTools, "create_message", None)):
+            return None
+        adapter = self.context.get_platform_inst(platform_id)
+        if adapter is None or not callable(getattr(adapter, "create_event", None)):
+            return None
+        try:
+            config = self.context.get_config(umo=umo)
+            streaming = bool(
+                config.get("provider_settings", {}).get("streaming_response", False)
+            )
+        except Exception:
+            return None
+        if streaming:
+            logger.warning(
+                "[background-image] synchronous fallback because streaming_response is enabled"
+            )
+            return None
+        return manager
+
+    async def _expire_background_send_gate(
+        self,
+        umo: str,
+        gate: asyncio.Event,
+    ) -> None:
+        """Release a reset/new send gate if the command pipeline never resolves.
+
+        Args:
+            umo: Unified message origin guarded by the gate.
+            gate: Exact gate instance to avoid deleting a newer barrier.
+        """
+
+        await asyncio.sleep(30)
+        current = self._background_send_gates.get(umo)
+        if current is gate:
+            self._background_send_gates.pop(umo, None)
+            gate.set()
+
+    async def _wait_background_send_gate(self, umo: str) -> None:
+        """Wait for a pending reset/new command before sending an image.
+
+        Args:
+            umo: Unified message origin about to receive an image.
+        """
+
+        gate = self._background_send_gates.get(umo)
+        if gate is None or gate.is_set():
+            return
+        try:
+            await asyncio.wait_for(gate.wait(), timeout=35)
+        except TimeoutError:
+            current = self._background_send_gates.get(umo)
+            if current is gate:
+                self._background_send_gates.pop(umo, None)
+                gate.set()
+
+    async def _build_background_delivery_target(
+        self, event: AstrMessageEvent
+    ) -> TaskDeliveryTarget:
+        """Capture the persistable routing data needed after the event ends.
+
+        Args:
+            event: Current LLM tool event.
+
+        Returns:
+            Immutable delivery target.
+        """
+
+        conversation = await self._resolve_plugin_conversation(event)
+        conversation_id = str(getattr(conversation, "cid", "") or "").strip()
+        message_type = event.get_message_type()
+        message_type_text = str(getattr(message_type, "value", message_type) or "")
+        return TaskDeliveryTarget(
+            platform_id=str(event.get_platform_id() or "").strip(),
+            platform_name=str(event.get_platform_name() or "").strip(),
+            message_type=message_type_text,
+            umo=str(event.unified_msg_origin or "").strip(),
+            session_id=str(event.get_session_id() or "").strip(),
+            group_id=str(event.get_group_id() or "").strip(),
+            self_id=str(event.get_self_id() or "").strip(),
+            sender_id=str(event.get_sender_id() or "").strip(),
+            sender_name=str(event.get_sender_name() or "").strip(),
+            source_message_id=str(
+                getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+            ).strip(),
+            conversation_id=conversation_id,
+        )
+
+    @staticmethod
+    def _output_intent_dict(intent: OutputIntent) -> dict[str, Any]:
+        return {
+            "exact_size": intent.exact_size,
+            "aspect_ratio": intent.aspect_ratio,
+            "resolution": intent.resolution,
+        }
+
+    async def _prepare_background_selfie(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        backend: str | None,
+        *,
+        follow_up_meta: dict[str, Any] | None = None,
+    ) -> tuple[list[bytes], str, dict[str, Any], dict[str, Any]]:
+        """Prepare selfie inputs and provider options without calling a provider.
+
+        Args:
+            event: Current tool event used only during input preparation.
+            prompt: User selfie request.
+            backend: Requested provider ID.
+            follow_up_meta: Optional previous selfie metadata.
+
+        Returns:
+            Input bytes, effective prompt, provider options, and task metadata.
+
+        Raises:
+            RuntimeError: Selfie configuration or reference inputs are invalid.
+        """
+
+        conf = self._get_selfie_conf()
+        if not self._is_selfie_enabled():
+            raise RuntimeError(self._selfie_disabled_message())
+        ref_paths, ref_source = await self._get_selfie_reference_paths(event)
+        ref_images = await self._read_paths_bytes(ref_paths)
+        if not ref_images:
+            raise RuntimeError(
+                "未设置自拍参考照。请先发送图片并设置自拍参考，或在 WebUI 上传参考图。"
+            )
+        if len(ref_images) > 1:
+            ref_images = [random.choice(ref_images)]
+        extra_segs = await get_images_from_event(event, include_avatar=False)
+        extra_bytes = await self._image_segs_to_bytes(extra_segs)
+        selection = self._context_selection(event)
+        reference_note = ""
+        combined_images = [*ref_images, *extra_bytes]
+        if selection:
+            combined_images, reference_note = compose_inputs(
+                selection, extra_bytes, identity_images=ref_images
+            )
+            extra_bytes = combined_images[len(ref_images) :]
+        effective_user_prompt = self._build_selfie_follow_up_prompt(
+            prompt, follow_up_meta
+        )
+        life_context = await self._get_life_context_without_llm()
+        effective_prompt = self._build_selfie_prompt(
+            effective_user_prompt,
+            extra_refs=len(extra_bytes),
+            life_context=life_context,
+            reference_note=reference_note,
+        )
+
+        chain_override: list[dict] | None = None
+        raw_chain = conf.get("chain", [])
+        if isinstance(raw_chain, list):
+            normalized_chain = [
+                normalized
+                for normalized in (
+                    self._normalize_chain_item(item) for item in raw_chain
+                )
+                if normalized is not None
+            ]
+            if normalized_chain:
+                chain_override = normalized_chain
+        use_edit_chain = bool(conf.get("use_edit_chain_when_empty", True))
+        if backend is None:
+            if chain_override is None and not use_edit_chain:
+                raise RuntimeError(
+                    "No selfie provider chain configured. Please configure features.selfie.chain."
+                )
+            if chain_override is not None and use_edit_chain:
+                chain_override = self._merge_selfie_chain_with_edit_chain(
+                    chain_override
+                )
+
+        raw_task_types = conf.get("gitee_task_types")
+        task_types = (
+            [str(item).strip() for item in raw_task_types if str(item).strip()]
+            if isinstance(raw_task_types, list) and raw_task_types
+            else ["id", "background", "style"]
+        )
+        options = {
+            "task_types": task_types,
+            "default_output": self._get_selfie_default_output(),
+            "chain_override": chain_override,
+            "infer_source_aspect": False,
+            "reference_source": ref_source,
+            "reference_count": len(ref_images),
+            "extra_reference_count": len(extra_bytes),
+            "life_context": life_context,
+            "reference_note": reference_note,
+        }
+        task_meta = self._build_image_task_meta(
+            mode="selfie_ref",
+            user_prompt=prompt,
+            effective_user_prompt=effective_user_prompt,
+            effective_prompt=effective_prompt,
+            reference_source=ref_source,
+            reference_count=len(ref_images),
+            extra_reference_count=len(extra_bytes),
+            continue_with="selfie_ref",
+            follow_up=follow_up_meta is not None,
+            backend=backend,
+        )
+        return combined_images, effective_prompt, options, task_meta
+
+    async def _accept_background_single(
+        self,
+        event: AstrMessageEvent,
+        *,
+        prompt: str,
+        mode: str,
+        backend: str,
+        output: str,
+        aspect_ratio: str,
+        resolution: str,
+    ) -> mcp.types.CallToolResult:
+        """Prepare and accept one LLM image task without provider blocking.
+
+        Args:
+            event: Current LLM tool event.
+            prompt: User image request.
+            mode: Requested routing mode.
+            backend: Requested provider override.
+            output: Legacy output specification.
+            aspect_ratio: Requested aspect ratio.
+            resolution: Requested resolution.
+
+        Returns:
+            Accepted task result or a deterministic preparation failure.
+        """
+
+        manager = self._background_manager_for_event(event)
+        if manager is None:
+            raise BackgroundTaskError("Background mode is unavailable for this event")
+
+        task_id = manager.new_task_id("img")
+        spooled = False
+        try:
+            target = await self._build_background_delivery_target(event)
+            output_intent = resolve_llm_output_intent(
+                prompt,
+                output=output,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+            )
+            resolved_mode = str(mode or "auto").strip().lower()
+            target_backend = self._resolve_target_backend(backend)
+            input_bytes: list[bytes] = []
+            options: dict[str, Any] = {}
+            task_meta: dict[str, Any]
+            effective_prompt = prompt
+
+            explicit_selfie = resolved_mode in {"selfie_ref", "selfie", "ref"}
+            follow_up_meta: dict[str, Any] | None = None
+            if explicit_selfie:
+                if not self._is_selfie_llm_enabled():
+                    raise RuntimeError("The requested selfie image tool is disabled.")
+                (
+                    input_bytes,
+                    effective_prompt,
+                    options,
+                    task_meta,
+                ) = await self._prepare_background_selfie(
+                    event,
+                    prompt,
+                    target_backend,
+                )
+                resolved_mode = "selfie_ref"
+            else:
+                prepared_selfie = False
+                if (
+                    resolved_mode == "auto"
+                    and self._is_selfie_enabled()
+                    and self._is_selfie_llm_enabled()
+                    and await self._should_auto_selfie_ref(event, prompt)
+                ):
+                    try:
+                        (
+                            input_bytes,
+                            effective_prompt,
+                            options,
+                            task_meta,
+                        ) = await self._prepare_background_selfie(
+                            event,
+                            prompt,
+                            target_backend,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[background-image] auto selfie preparation fell back: %s",
+                            BackgroundImageTaskManager.sanitize_error(exc),
+                        )
+                    else:
+                        resolved_mode = "selfie_ref"
+                        prepared_selfie = True
+
+                if resolved_mode == "auto" and not prepared_selfie:
+                    follow_up_meta = await self._match_selfie_follow_up(event, prompt)
+                    if follow_up_meta is not None:
+                        try:
+                            (
+                                input_bytes,
+                                effective_prompt,
+                                options,
+                                task_meta,
+                            ) = await self._prepare_background_selfie(
+                                event,
+                                prompt,
+                                target_backend,
+                                follow_up_meta=follow_up_meta,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "[background-image] selfie follow-up preparation fell back: %s",
+                                BackgroundImageTaskManager.sanitize_error(exc),
+                            )
+                        else:
+                            resolved_mode = "selfie_ref"
+                            prepared_selfie = True
+
+                if not prepared_selfie:
+                    has_message_images = await self._has_message_images(event)
+                    image_segs = None
+                    if resolved_mode == "auto" and not has_message_images:
+                        image_segs = await get_images_from_event(
+                            event,
+                            include_avatar=not bool(self._context_selection(event)),
+                            include_sender_avatar_fallback=False,
+                        )
+                    use_edit = resolved_mode in {"edit", "img2img", "aiedit"} or (
+                        resolved_mode == "auto"
+                        and (has_message_images or bool(image_segs))
+                    )
+                    if use_edit:
+                        edit_conf = self._get_feature("edit")
+                        if not bool(edit_conf.get("enabled", True)) or not bool(
+                            edit_conf.get("llm_tool_enabled", True)
+                        ):
+                            raise RuntimeError(
+                                "The requested image editing tool is disabled."
+                            )
+                        if image_segs is None:
+                            image_segs = await get_images_from_event(
+                                event,
+                                include_avatar=not bool(self._context_selection(event)),
+                                include_sender_avatar_fallback=False,
+                            )
+                        input_bytes = await self._image_segs_to_bytes(image_segs)
+                        selection = self._context_selection(event)
+                        reference_note = ""
+                        if selection:
+                            input_bytes, reference_note = compose_inputs(
+                                selection, input_bytes
+                            )
+                        if not input_bytes:
+                            raise RuntimeError(
+                                "No usable input image was found in the current message."
+                            )
+                        resolved_mode = "edit"
+                        effective_prompt = prompt + (
+                            "\n\n" + reference_note if reference_note else ""
+                        )
+                        task_meta = self._build_image_task_meta(
+                            mode="edit",
+                            user_prompt=prompt,
+                            effective_prompt=effective_prompt,
+                            continue_with="edit",
+                            backend=target_backend,
+                        )
+                    else:
+                        draw_conf = self._get_feature("draw")
+                        if not bool(draw_conf.get("enabled", True)) or not bool(
+                            draw_conf.get("llm_tool_enabled", True)
+                        ):
+                            raise RuntimeError(
+                                "The requested image generation tool is disabled."
+                            )
+                        resolved_mode = "draw"
+                        effective_prompt = prompt or "a selfie photo"
+                        task_meta = self._build_image_task_meta(
+                            mode="text",
+                            user_prompt=effective_prompt,
+                            effective_prompt=effective_prompt,
+                            continue_with="text",
+                            backend=target_backend,
+                        )
+
+            selection = self._context_selection(event)
+            if selection:
+                task_meta["reference_sources"] = list(selection.sources)
+            getter = getattr(event, "get_extra", None)
+            reference_receipt = getter(RECEIPT_KEY) if callable(getter) else None
+            input_paths, manifest = await manager.spool_inputs(task_id, input_bytes)
+            spooled = bool(input_paths)
+            scope = manager.scope_hash(
+                target.umo,
+                target.self_id,
+                target.sender_id,
+                target.conversation_id,
+            )
+            normalized_args = {
+                "prompt": prompt,
+                "mode": resolved_mode,
+                "backend": target_backend or "auto",
+                "output": self._output_intent_dict(output_intent),
+                "reference_sources": list(selection.sources) if selection else [],
+            }
+            fingerprint = manager.request_fingerprint(
+                scope,
+                target.source_message_id,
+                normalized_args,
+            )
+            record = {
+                "task_id": task_id,
+                "task_kind": "single",
+                "state": "queued",
+                "scope_hash": scope,
+                "request_fingerprint": fingerprint,
+                **BackgroundImageTaskManager.dataclass_dict(target),
+                "mode": resolved_mode,
+                "backend_requested": target_backend or "auto",
+                "aspect_ratio": output_intent.aspect_ratio or "",
+                "resolution": output_intent.resolution or "",
+                "user_prompt": prompt,
+                "effective_prompt": effective_prompt,
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "mode": resolved_mode,
+                        "effective_prompt": effective_prompt,
+                        "state": "queued",
+                        "error_code": "",
+                    }
+                ],
+                "current_attempt": 1,
+                "input_manifest": manifest,
+                "reference_sources": list(selection.sources) if selection else [],
+                "reference_source": options.get("reference_source", ""),
+                "reference_count": options.get("reference_count", 0),
+                "extra_reference_count": options.get("extra_reference_count", 0),
+                "image_generated": False,
+                "image_sent": False,
+                "delivery_state": "not_started",
+                "items": [],
+                "reset_epoch": 0,
+            }
+            stored, created = await manager.create_task_record(record, reservation=1)
+            if not created:
+                await manager.cleanup_task_files(task_id)
+                task_id = str(stored["task_id"])
+            else:
+                job = PreparedImageJob(
+                    mode=resolved_mode,
+                    user_prompt=prompt,
+                    effective_prompt=effective_prompt,
+                    backend=target_backend,
+                    output=self._output_intent_dict(output_intent),
+                    input_paths=input_paths,
+                    task_meta=task_meta,
+                    options={**options, "input_manifest": manifest},
+                )
+                manager.start_worker(
+                    task_id,
+                    lambda: self._run_background_single(
+                        manager,
+                        task_id,
+                        job,
+                        target,
+                        reference_receipt=reference_receipt,
+                    ),
+                )
+
+            event.set_extra("_gitee_bg_ack_task_id", task_id)
+            event.set_extra("_gitee_bg_ack_token", stored.get("ack_token", ""))
+            response = {
+                "status": "accepted",
+                "task_id": task_id,
+                "task_kind": "single",
+                "state": str(stored.get("state") or "queued"),
+                "mode": str(stored.get("mode") or resolved_mode),
+                "user_prompt": str(stored.get("user_prompt") or prompt),
+                "effective_prompt": str(
+                    stored.get("effective_prompt") or effective_prompt
+                ),
+                "message": (
+                    "The image task is running in the background. Respond naturally "
+                    "as yourself, tell the user it is underway, and say they can "
+                    "continue chatting. Do not imply that the image is finished."
+                ),
+            }
+            return self._llm_tool_text_result(json.dumps(response, ensure_ascii=False))
+        except Exception:
+            if spooled:
+                await manager.cleanup_task_files(task_id)
+            raise
+
+    async def _execute_prepared_image_job(
+        self,
+        manager: BackgroundImageTaskManager,
+        job: PreparedImageJob,
+    ) -> tuple[Path, dict[str, Any]]:
+        """Execute one prepared provider call without accessing an old event.
+
+        Args:
+            manager: Owning task manager.
+            job: Immutable provider input.
+
+        Returns:
+            Generated image path and follow-up metadata.
+        """
+
+        intent = OutputIntent(**job.output)
+        images = await manager.read_spooled_inputs(
+            job.input_paths,
+            job.options.get("input_manifest"),
+        )
+        if job.mode == "draw":
+            image_path = await self.draw.generate(
+                job.effective_prompt,
+                provider_id=job.backend,
+                output_intent=intent,
+            )
+            return image_path, dict(job.task_meta)
+        if job.mode == "edit":
+            image_path = await self.edit.edit(
+                prompt=job.effective_prompt,
+                images=images,
+                **(
+                    {"require_ordered_references": True}
+                    if job.task_meta.get("reference_sources")
+                    else {}
+                ),
+                backend=job.backend,
+                output_intent=intent,
+            )
+            return image_path, dict(job.task_meta)
+        if job.mode == "selfie_ref":
+            image_path = await self.edit.edit(
+                prompt=job.effective_prompt,
+                images=images,
+                **(
+                    {"require_ordered_references": True}
+                    if job.task_meta.get("reference_sources") or len(images) > 1
+                    else {}
+                ),
+                backend=job.backend,
+                task_types=job.options.get("task_types"),
+                output_intent=intent,
+                default_output=job.options.get("default_output"),
+                chain_override=job.options.get("chain_override"),
+                infer_source_aspect=False,
+            )
+            return image_path, dict(job.task_meta)
+        raise RuntimeError(f"Unsupported prepared image mode: {job.mode}")
+
+    async def _rebuild_background_event(
+        self,
+        target: TaskDeliveryTarget,
+        *,
+        message: list[Any] | None = None,
+        message_str: str = "",
+    ) -> AstrMessageEvent:
+        """Build a fresh event from a persistable delivery target.
+
+        Args:
+            target: Persisted platform route.
+            message: Synthetic input chain.
+            message_str: Synthetic plain message string.
+
+        Returns:
+            Fresh adapter event using the currently active adapter instance.
+        """
+
+        adapter = self.context.get_platform_inst(target.platform_id)
+        if adapter is None:
+            raise RuntimeError(f"Platform is no longer available: {target.platform_id}")
+        abm = await StarTools.create_message(
+            type=target.message_type,
+            self_id=target.self_id,
+            session_id=target.session_id,
+            sender=MessageMember(
+                user_id=target.sender_id,
+                nickname=target.sender_name or None,
+            ),
+            message=list(message or []),
+            message_str=message_str,
+            message_id=f"gitee-bg-{BackgroundImageTaskManager.new_task_id('event')}",
+            raw_message=None,
+            group_id=target.group_id,
+        )
+        rebuilt = adapter.create_event(abm)
+        rebuilt.is_wake = True
+        rebuilt.is_at_or_wake_command = True
+        return rebuilt
+
+    @staticmethod
+    def _is_unknown_delivery_error(exc: BaseException) -> bool:
+        if isinstance(exc, (TimeoutError, ConnectionError, asyncio.TimeoutError)):
+            return True
+        text = str(exc or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "timeout",
+                "timed out",
+                "connection reset",
+                "broken pipe",
+                "server disconnected",
+                "connection closed",
+            )
+        )
+
+    async def _send_background_image_once(
+        self,
+        target: TaskDeliveryTarget,
+        image_path: Path,
+    ) -> AstrMessageEvent:
+        """Send an image-only chain exactly once through the current adapter.
+
+        Args:
+            target: Persisted delivery route.
+            image_path: Generated image path.
+
+        Returns:
+            Fresh event whose send await returned successfully.
+        """
+
+        event = await self._rebuild_background_event(target)
+        original_path = Path(image_path)
+        send_path = await self._prepare_image_for_send(event, original_path)
+        cleanup = self._is_weixin_send_temp_path(send_path) and (
+            send_path.resolve(strict=False) != original_path.resolve(strict=False)
+        )
+        try:
+            timeout = self._as_int(
+                self._get_send_conf().get("background_send_timeout_seconds", 120),
+                default=120,
+            )
+            try:
+                send_as_file = (
+                    send_path.stat().st_size > self.IMAGE_AS_FILE_THRESHOLD_BYTES
+                )
+            except OSError:
+                send_as_file = False
+            component = (
+                File(name=send_path.name, file=str(send_path))
+                if send_as_file
+                else Image.fromFileSystem(str(send_path))
+            )
+            await asyncio.wait_for(
+                event.send(event.chain_result([component])),
+                timeout=float(max(15, min(300, timeout))),
+            )
+            return event
+        finally:
+            if cleanup:
+                await asyncio.to_thread(
+                    self._remove_weixin_send_temp_image_sync,
+                    send_path,
+                )
+
+    async def _wait_for_background_ack(
+        self,
+        manager: BackgroundImageTaskManager,
+        task_id: str,
+    ) -> None:
+        for _ in range(40):
+            record = await manager.get_task(task_id)
+            if record is None or record.get("ack_state") != "pending":
+                return
+            await asyncio.sleep(0.25)
+
+    async def _describe_spooled_objects(self, manager, job, umo):
+        sources = (
+            job.task_meta if isinstance(job, PreparedImageJob) else job.options
+        ).get("reference_sources", [])
+        if not any(source.get("role") == "object" for source in sources):
+            return "", "not_needed"
+        try:
+            provider = self.context.get_using_provider(umo=umo)
+        except Exception:
+            return "", "vision_unavailable"
+        images = await manager.read_spooled_inputs(
+            job.input_paths, job.options.get("input_manifest")
+        )
+        return await describe_reference_objects(
+            provider, images, sources, int(job.options.get("reference_count") or 0)
+        )
+
+    async def _run_background_single(
+        self,
+        manager: BackgroundImageTaskManager,
+        task_id: str,
+        job: PreparedImageJob,
+        target: TaskDeliveryTarget,
+        *,
+        reference_receipt=None,
+    ) -> None:
+        """Run one durable image task to generation, delivery, and notification.
+
+        Args:
+            manager: Owning task manager.
+            task_id: Durable task ID.
+            job: Event-independent provider input.
+            target: Persisted platform route.
+        """
+
+        try:
+
+            async def provider_call() -> tuple[Path, dict[str, Any]]:
+                nonlocal job
+                note, state = await self._describe_spooled_objects(
+                    manager, job, target.umo
+                )
+                prompt = job.effective_prompt + ("\n\n" + note if note else "")
+                meta = {
+                    **job.task_meta,
+                    "reference_vision": state,
+                    "effective_prompt": prompt,
+                }
+                job = replace(job, effective_prompt=prompt, task_meta=meta)
+                await manager.transition(
+                    task_id,
+                    "running",
+                    {
+                        "effective_prompt": job.effective_prompt,
+                        "task_meta": job.task_meta,
+                        "attempts": [
+                            {
+                                "attempt": 1,
+                                "mode": job.mode,
+                                "effective_prompt": job.effective_prompt,
+                                "state": "running",
+                                "error_code": "",
+                            }
+                        ],
+                    },
+                )
+                return await self._execute_prepared_image_job(manager, job)
+
+            image_path, task_meta = await asyncio.wait_for(
+                manager.run_provider(task_id, provider_call),
+                timeout=2 * 60 * 60,
+            )
+            if manager.is_cancelled(task_id):
+                raise asyncio.CancelledError
+            await self._wait_for_background_ack(manager, task_id)
+            await self._wait_background_send_gate(target.umo)
+            if manager.is_cancelled(task_id):
+                raise asyncio.CancelledError
+            send_attempt_id = manager.new_task_id("send")
+            await manager.transition(
+                task_id,
+                "sending",
+                {
+                    "image_generated": True,
+                    "delivery_state": "attempting",
+                    "send_attempt_id": send_attempt_id,
+                },
+            )
+            await manager.record_receipt(
+                task_id,
+                send_attempt_id=send_attempt_id,
+                kind="image",
+                delivery_state="attempting",
+                transport=target.platform_name,
+            )
+            try:
+                delivery_event = await self._send_background_image_once(
+                    target,
+                    image_path,
+                )
+            except Exception as exc:
+                unknown = self._is_unknown_delivery_error(exc)
+                delivery_state = "unknown" if unknown else "not_started"
+                await manager.record_receipt(
+                    task_id,
+                    send_attempt_id=send_attempt_id,
+                    kind="image",
+                    delivery_state="unknown" if unknown else "not_started",
+                    transport=target.platform_name,
+                    response_digest=hashlib.sha256(str(exc).encode()).hexdigest(),
+                )
+                terminal_state = "interrupted" if unknown else "failed"
+                record = await manager.transition(
+                    task_id,
+                    terminal_state,
+                    {
+                        "image_generated": True,
+                        "image_sent": False,
+                        "delivery_state": delivery_state,
+                        "error_code": "delivery_unknown"
+                        if unknown
+                        else "delivery_failed",
+                        "error_message": manager.sanitize_error(exc),
+                        "terminal_reason": "image_delivery",
+                    },
+                    queue_notification=True,
+                )
+                await self._dispatch_background_completion(manager, record, target)
+                return
+
+            await manager.record_receipt(
+                task_id,
+                send_attempt_id=send_attempt_id,
+                kind="image",
+                delivery_state="confirmed",
+                transport=target.platform_name,
+                response_digest=hashlib.sha256(str(image_path).encode()).hexdigest(),
+            )
+            self._remember_last_image(delivery_event, image_path)
+            await self._publish_context_result(
+                delivery_event,
+                image_path,
+                task_meta,
+                receipt=reference_receipt,
+                task_id=task_id,
+            )
+            await self._save_last_image_task_meta(delivery_event, task_meta)
+            record = await manager.transition(
+                task_id,
+                "completed",
+                {
+                    "image_generated": True,
+                    "image_sent": True,
+                    "delivery_state": "confirmed",
+                    "task_meta": task_meta,
+                    "terminal_reason": "completed",
+                },
+                queue_notification=True,
+            )
+            await self._dispatch_background_completion(manager, record, target)
+        except asyncio.CancelledError:
+            record = await manager.get_task(task_id)
+            if record and record.get("state") not in TERMINAL_STATES:
+                try:
+                    record = await asyncio.shield(
+                        manager.transition(
+                            task_id,
+                            "interrupted",
+                            {
+                                "error_code": "plugin_shutdown",
+                                "error_message": "The image task was interrupted before completion.",
+                                "terminal_reason": "plugin_shutdown",
+                            },
+                            queue_notification=True,
+                        )
+                    )
+                except Exception:
+                    pass
+                else:
+                    await self._dispatch_background_completion(manager, record, target)
+            raise
+        except Exception as exc:
+            logger.error(
+                "[background-image] single task failed: task=%s err=%s",
+                task_id,
+                manager.sanitize_error(exc),
+                exc_info=True,
+            )
+            record = await manager.get_task(task_id)
+            if record and record.get("state") not in TERMINAL_STATES:
+                record = await manager.transition(
+                    task_id,
+                    "failed",
+                    {
+                        "error_code": "provider_failed",
+                        "error_message": manager.sanitize_error(exc),
+                        "terminal_reason": "provider_failed",
+                    },
+                    queue_notification=True,
+                )
+                await self._dispatch_background_completion(manager, record, target)
+        finally:
+            await manager.cleanup_task_files(task_id)
+
+    @staticmethod
+    def _delivery_target_from_record(record: dict[str, Any]) -> TaskDeliveryTarget:
+        return TaskDeliveryTarget(
+            platform_id=str(record.get("platform_id") or ""),
+            platform_name=str(record.get("platform_name") or ""),
+            message_type=str(record.get("message_type") or "FriendMessage"),
+            umo=str(record.get("umo") or ""),
+            session_id=str(record.get("session_id") or ""),
+            group_id=str(record.get("group_id") or ""),
+            self_id=str(record.get("self_id") or ""),
+            sender_id=str(record.get("sender_id") or ""),
+            sender_name=str(record.get("sender_name") or ""),
+            source_message_id=str(record.get("source_message_id") or ""),
+            conversation_id=str(record.get("conversation_id") or ""),
+        )
+
+    async def _background_context_is_safe(
+        self,
+        target: TaskDeliveryTarget,
+    ) -> tuple[bool, Any | None]:
+        """Check conversation and ContextAware state before synthetic re-entry.
+
+        Args:
+            target: Original task route and conversation binding.
+
+        Returns:
+            ``(safe, conversation)`` for normal Agent completion.
+        """
+
+        conversation_manager = getattr(self.context, "conversation_manager", None)
+        if conversation_manager is None or not target.conversation_id:
+            return False, None
+        try:
+            current_id = await conversation_manager.get_curr_conversation_id(target.umo)
+            if str(current_id or "") != target.conversation_id:
+                return False, None
+            conversation = await conversation_manager.get_conversation(
+                target.umo,
+                target.conversation_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[background-image] conversation gate failed: %s",
+                BackgroundImageTaskManager.sanitize_error(exc),
+            )
+            return False, None
+        if conversation is None:
+            return False, None
+
+        if target.group_id:
+            try:
+                metadata = self.context.get_registered_star(
+                    "astrbot_plugin_context_aware"
+                )
+                context_aware = getattr(metadata, "star_cls", None)
+                if context_aware is not None:
+                    has_session = getattr(context_aware, "has_session", None)
+                    if not callable(has_session):
+                        return False, None
+                    session_exists = has_session(target.umo)
+                    if inspect.isawaitable(session_exists):
+                        session_exists = await session_exists
+                    if not bool(session_exists):
+                        return False, None
+            except Exception as exc:
+                logger.warning(
+                    "[background-image] ContextAware gate failed: %s",
+                    BackgroundImageTaskManager.sanitize_error(exc),
+                )
+                return False, None
+        return True, conversation
+
+    async def _cancel_background_scope_with_notifications(
+        self,
+        manager: BackgroundImageTaskManager,
+        *,
+        umo: str,
+        sender_id: str,
+        reason: str,
+        suppress_future_injection: bool = False,
+    ) -> int:
+        """Cancel scoped tasks and dispatch each cancellation outbox.
+
+        Args:
+            manager: Owning task manager.
+            umo: Unified message origin.
+            sender_id: Requester whose active tasks should stop.
+            reason: Durable cancellation reason.
+            suppress_future_injection: Hide records after reset/new.
+
+        Returns:
+            Number of tasks cancelled.
+        """
+
+        records = [
+            record
+            for record in await manager.list_active_for_umo(umo)
+            if str(record.get("sender_id") or "") == str(sender_id or "")
+        ]
+        cancelled = 0
+        for record in records:
+            task_id = str(record.get("task_id") or "")
+            if not task_id:
+                continue
+            if not await manager.cancel_task(
+                task_id,
+                reason,
+                suppress_future_injection=suppress_future_injection,
+            ):
+                continue
+            cancelled += 1
+            terminal = await manager.get_task(task_id)
+            if terminal is not None:
+                await self._dispatch_background_completion(
+                    manager,
+                    terminal,
+                    self._delivery_target_from_record(terminal),
+                )
+        return cancelled
+
+    async def _silence_background_notification(
+        self,
+        manager: BackgroundImageTaskManager,
+        *,
+        token: str,
+        task_id: str,
+        attempt_id: str,
+        reason: str,
+    ) -> None:
+        """Close a completion notification without sending fallback text.
+
+        Args:
+            manager: Owning durable task manager.
+            token: Notification outbox token.
+            task_id: Task whose completion notification is being abandoned.
+            attempt_id: Current notification claim ID.
+            reason: Internal reason recorded in logs.
+        """
+
+        marked = await manager.mark_notification(
+            token,
+            "failed",
+            attempt_id=attempt_id,
+        )
+        logger.info(
+            "[background-image] completion notification silenced: task=%s reason=%s marked=%s",
+            task_id,
+            reason,
+            marked,
+        )
+
+    async def _background_notification_watchdog(
+        self,
+        manager: BackgroundImageTaskManager,
+        task_id: str,
+        token: str,
+    ) -> None:
+        """Silently close an Agent completion that exceeds its deadline.
+
+        Args:
+            manager: Owning durable task manager.
+            task_id: Task waiting for a natural Agent completion.
+            token: Notification outbox token.
+        """
+
+        await asyncio.sleep(90)
+        attempt_id = manager.new_task_id("notify-watchdog")
+        record = await manager.claim_notification(
+            token,
+            attempt_id,
+            from_states=("pending", "queued"),
+        )
+        if record is None:
+            return
+        await self._silence_background_notification(
+            manager,
+            token=token,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            reason="agent completion exceeded the watchdog deadline",
+        )
+
+    async def _dispatch_background_completion(
+        self,
+        manager: BackgroundImageTaskManager,
+        record: dict[str, Any],
+        target: TaskDeliveryTarget,
+    ) -> None:
+        """Serialize one terminal notification through its original UMO.
+
+        Args:
+            manager: Owning task manager.
+            record: Terminal durable record.
+            target: Original platform route.
+        """
+
+        async with manager.notification_turn(target.umo):
+            await self._dispatch_background_completion_once(manager, record, target)
+
+    async def _dispatch_background_completion_once(
+        self,
+        manager: BackgroundImageTaskManager,
+        record: dict[str, Any],
+        target: TaskDeliveryTarget,
+    ) -> None:
+        """Route a terminal task to Agent or silently close its notification.
+
+        Args:
+            manager: Owning task manager.
+            record: Terminal durable record.
+            target: Original platform route.
+        """
+
+        if manager.is_closing:
+            return
+        token = str(record.get("notification_token") or "")
+        if not token:
+            return
+        recovered_after_restart = str(record.get("terminal_reason") or "") in {
+            "process_restarted",
+            "plugin_shutdown",
+        } or str(record.get("error_code") or "") in {
+            "process_restarted",
+            "plugin_shutdown",
+        }
+        if recovered_after_restart:
+            safe, conversation = False, None
+        else:
+            safe, conversation = await self._background_context_is_safe(target)
+        attempt_id = manager.new_task_id("notify-agent" if safe else "notify-silent")
+        claimed = await manager.claim_notification(token, attempt_id)
+        if claimed is None:
+            return
+        if not safe:
+            await self._silence_background_notification(
+                manager,
+                token=token,
+                task_id=str(claimed.get("task_id") or record.get("task_id") or ""),
+                attempt_id=attempt_id,
+                reason=(
+                    "restart recovery cannot safely re-enter the old conversation"
+                    if recovered_after_restart
+                    else "conversation context is unavailable"
+                ),
+            )
+            return
+
+        message_id = target.source_message_id or manager.new_task_id("source")
+        synthetic_chain: list[Any] = []
+        if target.group_id:
+            synthetic_chain.append(At(qq=target.self_id))
+        synthetic_chain.append(
+            Reply(
+                id=message_id,
+                sender_id=target.sender_id,
+                sender_nickname=target.sender_name,
+                message_str="",
+            )
+        )
+        try:
+            event = await self._rebuild_background_event(
+                target,
+                message=synthetic_chain,
+            )
+            event.set_extra("_gitee_bg_completion", True)
+            event.set_extra("_gitee_bg_task_id", str(record.get("task_id") or ""))
+            event.set_extra("_gitee_bg_notification_token", token)
+            event.set_extra("_gitee_bg_notification_attempt", attempt_id)
+            request = event.request_llm(
+                prompt=(
+                    "An image task has reached a terminal state. Use the temporary "
+                    "background task facts injected by the Gitee image plugin. Respond "
+                    "once, naturally in your existing persona, to the original requester. "
+                    "Do not call image tools and do not claim delivery beyond the recorded facts."
+                ),
+                conversation=conversation,
+            )
+            event.set_extra("provider_request", request)
+            adapter = self.context.get_platform_inst(target.platform_id)
+            if adapter is None:
+                raise RuntimeError(
+                    "Platform adapter disappeared before completion enqueue"
+                )
+            queued = await manager.mark_notification(
+                token,
+                "queued",
+                attempt_id=attempt_id,
+            )
+            if not queued:
+                logger.warning(
+                    "[background-image] suppressed completion after its claim changed: task=%s",
+                    record.get("task_id"),
+                )
+                return
+            adapter.commit_event(event)
+        except Exception as exc:
+            logger.warning(
+                "[background-image] synthetic completion enqueue failed: task=%s err=%s",
+                record.get("task_id"),
+                manager.sanitize_error(exc),
+            )
+            await self._silence_background_notification(
+                manager,
+                token=token,
+                task_id=str(claimed.get("task_id") or record.get("task_id") or ""),
+                attempt_id=attempt_id,
+                reason="synthetic completion could not be enqueued",
+            )
+            return
+        manager.start_managed(
+            self._background_notification_watchdog(
+                manager,
+                str(record.get("task_id") or ""),
+                token,
+            ),
+            name=f"background-notification-watchdog-{record.get('task_id')}",
+        )
+        completed = await manager.wait_notification_terminal(
+            token,
+            timeout_seconds=360,
+        )
+        if completed:
+            return
+        marked = await manager.mark_notification(
+            token,
+            "unknown",
+            attempt_id=attempt_id,
+        )
+        logger.warning(
+            "[background-image] notification turn timed out: task=%s marked_unknown=%s",
+            record.get("task_id"),
+            marked,
+        )
+
+    async def _accept_background_batch(
+        self,
+        event: AstrMessageEvent,
+        *,
+        prompt: str,
+        count: int,
+        mode: str,
+        backend: str,
+        output: str,
+        aspect_ratio: str,
+        resolution: str,
+    ) -> mcp.types.CallToolResult:
+        """Accept an LLM batch before planner or image provider execution.
+
+        Args:
+            event: Current LLM tool event.
+            prompt: Shared user request.
+            count: Requested child count.
+            mode: Requested routing mode.
+            backend: Requested provider override.
+            output: Legacy output specification.
+            aspect_ratio: Shared aspect ratio override.
+            resolution: Shared resolution override.
+
+        Returns:
+            Accepted batch task result.
+        """
+
+        manager = self._background_manager_for_event(event)
+        if manager is None:
+            raise BackgroundTaskError("Background mode is unavailable for this event")
+        task_id = manager.new_task_id("batch")
+        spooled = False
+        try:
+            target = await self._build_background_delivery_target(event)
+            requested_count = max(
+                1,
+                min(self._get_batch_max_count(), self._as_int(count, default=4)),
+            )
+            resolved_mode = await self._resolve_llm_batch_mode(event, mode, prompt)
+            target_backend = self._resolve_target_backend(backend)
+            output_intent = resolve_llm_output_intent(
+                prompt,
+                output=output,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+            )
+            selection = self._context_selection(event)
+            getter = getattr(event, "get_extra", None)
+            reference_receipt = getter(RECEIPT_KEY) if callable(getter) else None
+            if selection and resolved_mode not in {"edit", "selfie_ref"}:
+                raise ValueError("Explicit references require edit or selfie_ref mode")
+            input_bytes: list[bytes] = []
+            options: dict[str, Any] = {}
+            if resolved_mode == "draw":
+                draw_conf = self._get_feature("draw")
+                if not bool(draw_conf.get("enabled", True)) or not bool(
+                    draw_conf.get("llm_tool_enabled", True)
+                ):
+                    raise RuntimeError(
+                        "The requested batch text-to-image tool is disabled."
+                    )
+            elif resolved_mode == "edit":
+                edit_conf = self._get_feature("edit")
+                if not bool(edit_conf.get("enabled", True)) or not bool(
+                    edit_conf.get("llm_tool_enabled", True)
+                ):
+                    raise RuntimeError(
+                        "The requested batch image editing tool is disabled."
+                    )
+                if selection:
+                    native = await get_images_from_event(event, include_avatar=False)
+                    input_bytes, reference_note = compose_inputs(
+                        selection, await self._image_segs_to_bytes(native)
+                    )
+                    options["reference_note"] = reference_note
+                else:
+                    input_bytes = await self._prepare_edit_image_bytes(event)
+            elif resolved_mode == "selfie_ref":
+                if not self._is_selfie_enabled() or not self._is_selfie_llm_enabled():
+                    raise RuntimeError("The requested batch selfie tool is disabled.")
+                input_bytes, _, options, _ = await self._prepare_background_selfie(
+                    event,
+                    prompt,
+                    target_backend,
+                )
+
+            if selection:
+                options["reference_sources"] = list(selection.sources)
+
+            portrait_contract = event.get_extra("_gitee_portrait_contract", "")
+            if portrait_contract:
+                options["reference_note"] = (
+                    str(options.get("reference_note") or "") + "\n" + portrait_contract
+                )
+            input_paths, manifest = await manager.spool_inputs(task_id, input_bytes)
+            spooled = bool(input_paths)
+            scope = manager.scope_hash(
+                target.umo,
+                target.self_id,
+                target.sender_id,
+                target.conversation_id,
+            )
+            normalized_args = {
+                "prompt": prompt,
+                "count": requested_count,
+                "mode": resolved_mode,
+                "backend": target_backend or "auto",
+                "output": self._output_intent_dict(output_intent),
+                "reference_sources": options.get("reference_sources", []),
+            }
+            fingerprint = manager.request_fingerprint(
+                scope,
+                target.source_message_id,
+                normalized_args,
+            )
+            record = {
+                "task_id": task_id,
+                "task_kind": "batch",
+                "state": "planning",
+                "scope_hash": scope,
+                "request_fingerprint": fingerprint,
+                **BackgroundImageTaskManager.dataclass_dict(target),
+                "mode": resolved_mode,
+                "backend_requested": target_backend or "auto",
+                "aspect_ratio": output_intent.aspect_ratio or "",
+                "resolution": output_intent.resolution or "",
+                "user_prompt": prompt,
+                "effective_prompt": "",
+                "requested_count": requested_count,
+                "planned_count": 0,
+                "generated_count": 0,
+                "sent_count": 0,
+                "failed_count": 0,
+                "cancelled_count": 0,
+                "unknown_count": 0,
+                "input_manifest": manifest,
+                "reference_sources": options.get("reference_sources", []),
+                "reference_source": options.get("reference_source", ""),
+                "reference_count": options.get("reference_count", 0),
+                "extra_reference_count": options.get("extra_reference_count", 0),
+                "image_generated": False,
+                "image_sent": False,
+                "delivery_state": "not_started",
+                "items": [],
+                "reset_epoch": 0,
+            }
+            stored, created = await manager.create_task_record(
+                record,
+                reservation=requested_count,
+            )
+            if not created:
+                await manager.cleanup_task_files(task_id)
+                task_id = str(stored["task_id"])
+            else:
+                job = PreparedBatchJob(
+                    mode=resolved_mode,
+                    user_prompt=prompt,
+                    requested_count=requested_count,
+                    backend=target_backend,
+                    output=self._output_intent_dict(output_intent),
+                    input_paths=input_paths,
+                    options={
+                        **options,
+                        "input_manifest": manifest,
+                        "fixed_aspect_ratio": output_intent.aspect_ratio
+                        or aspect_ratio_from_size(output_intent.exact_size),
+                    },
+                )
+                manager.start_worker(
+                    task_id,
+                    lambda: self._run_background_batch(
+                        manager,
+                        task_id,
+                        job,
+                        target,
+                        reference_receipt=reference_receipt,
+                    ),
+                )
+
+            event.set_extra("_gitee_bg_ack_task_id", task_id)
+            event.set_extra("_gitee_bg_ack_token", stored.get("ack_token", ""))
+            response = {
+                "status": "accepted",
+                "task_id": task_id,
+                "task_kind": "batch",
+                "state": str(stored.get("state") or "planning"),
+                "requested_count": int(
+                    stored.get("requested_count") or requested_count
+                ),
+                "mode": str(stored.get("mode") or resolved_mode),
+                "user_prompt": str(stored.get("user_prompt") or prompt),
+                "message": (
+                    "The batch image task was accepted before planning and is now "
+                    "running in the background. Respond naturally with the accepted "
+                    "count and tell the user they can continue chatting. Do not invent "
+                    "child prompts until the planner has stored them."
+                ),
+            }
+            return self._llm_tool_text_result(json.dumps(response, ensure_ascii=False))
+        except Exception:
+            if spooled:
+                await manager.cleanup_task_files(task_id)
+            raise
+
+    async def _run_background_batch_child(
+        self,
+        manager: BackgroundImageTaskManager,
+        task_id: str,
+        item: dict[str, Any],
+        job: PreparedImageJob,
+        child_limit: asyncio.Semaphore,
+        generated: dict[str, tuple[Path, dict[str, Any]]],
+    ) -> None:
+        """Generate one batch child through the shared fair scheduler.
+
+        Args:
+            manager: Owning task manager.
+            task_id: Batch parent ID.
+            item: Mutable child descriptor from the durable record.
+            job: Prepared child provider input.
+            child_limit: Per-parent concurrency limit.
+            generated: In-process successful image results by item ID.
+        """
+
+        item_id = str(item["item_id"])
+        try:
+            async with child_limit:
+
+                async def provider_call() -> tuple[Path, dict[str, Any]]:
+                    await manager.update_item(
+                        task_id,
+                        item_id,
+                        {"state": "running", "started_at": manager.now_ms()},
+                    )
+                    return await self._execute_prepared_image_job(manager, job)
+
+                result = await asyncio.wait_for(
+                    manager.run_provider(task_id, provider_call),
+                    timeout=2 * 60 * 60,
+                )
+            generated[item_id] = result
+            await manager.update_item(
+                task_id,
+                item_id,
+                {
+                    "state": "generated",
+                    "image_generated": True,
+                    "delivery_state": "not_started",
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await manager.update_item(
+                task_id,
+                item_id,
+                {
+                    "state": "failed",
+                    "error_code": "provider_failed",
+                    "error_message": manager.sanitize_error(exc),
+                },
+                release_if_terminal=True,
+            )
+
+    async def _run_background_batch(
+        self,
+        manager: BackgroundImageTaskManager,
+        task_id: str,
+        job: PreparedBatchJob,
+        target: TaskDeliveryTarget,
+        *,
+        reference_receipt=None,
+    ) -> None:
+        """Plan, fairly generate, and sequentially deliver one image batch.
+
+        Args:
+            manager: Owning task manager.
+            task_id: Durable batch parent ID.
+            job: Event-independent batch input.
+            target: Persisted platform route.
+        """
+
+        child_tasks: list[asyncio.Task[Any]] = []
+        try:
+            note, state = await manager.run_planner(
+                lambda: self._describe_spooled_objects(manager, job, target.umo)
+            )
+            options = {**job.options, "reference_vision": state}
+            if note:
+                options["reference_note"] = (
+                    str(options.get("reference_note") or "") + "\n" + note
+                )
+            job = replace(job, options=options)
+            planned_items = await asyncio.wait_for(
+                manager.run_planner(
+                    lambda: self._plan_batch_prompt_items(
+                        mode=job.mode,
+                        user_prompt=job.user_prompt,
+                        count=job.requested_count,
+                        fixed_aspect_ratio=job.options.get("fixed_aspect_ratio"),
+                        umo=target.umo,
+                    )
+                ),
+                timeout=300,
+            )
+            if len(planned_items) != job.requested_count:
+                raise RuntimeError(
+                    "Batch planner returned "
+                    f"{len(planned_items)} items for {job.requested_count} reserved slots"
+                )
+            common_intent = OutputIntent(**job.output)
+            items: list[dict[str, Any]] = []
+            child_jobs: list[PreparedImageJob] = []
+            for index, planned in enumerate(planned_items, start=1):
+                item_id = f"{task_id}_{index:02d}"
+                effective_prompt = planned.prompt
+                if job.mode == "selfie_ref":
+                    effective_prompt = self._build_selfie_prompt(
+                        planned.prompt,
+                        extra_refs=int(job.options.get("extra_reference_count") or 0),
+                        life_context=job.options.get("life_context"),
+                        reference_note=str(job.options.get("reference_note") or ""),
+                    )
+                elif job.options.get("reference_note"):
+                    effective_prompt += "\n\n参考图用途：\n" + str(
+                        job.options["reference_note"]
+                    )
+                item_intent = merge_output_intents(
+                    common_intent,
+                    OutputIntent(aspect_ratio=planned.aspect_ratio),
+                )
+                item = {
+                    "item_id": item_id,
+                    "index": index,
+                    "state": "queued",
+                    "mode": job.mode,
+                    "title": planned.title,
+                    "variation_focus": planned.variation_focus,
+                    "user_prompt": planned.prompt,
+                    "effective_prompt": effective_prompt,
+                    "aspect_ratio": planned.aspect_ratio,
+                    "image_generated": False,
+                    "image_sent": False,
+                    "delivery_state": "not_started",
+                    "error_code": "",
+                    "error_message": "",
+                    "send_attempt_id": "",
+                }
+                if job.mode == "selfie_ref":
+                    task_meta = self._build_image_task_meta(
+                        mode="selfie_ref",
+                        user_prompt=planned.prompt,
+                        effective_prompt=effective_prompt,
+                        reference_source=str(job.options.get("reference_source") or ""),
+                        reference_count=int(job.options.get("reference_count") or 0),
+                        extra_reference_count=int(
+                            job.options.get("extra_reference_count") or 0
+                        ),
+                        continue_with="selfie_ref",
+                        backend=job.backend,
+                    )
+                else:
+                    task_meta = self._build_image_task_meta(
+                        mode="text" if job.mode == "draw" else "edit",
+                        user_prompt=planned.prompt,
+                        effective_prompt=effective_prompt,
+                        continue_with="text" if job.mode == "draw" else "edit",
+                        backend=job.backend,
+                    )
+                if job.options.get("reference_sources"):
+                    task_meta["reference_sources"] = list(
+                        job.options["reference_sources"]
+                    )
+                task_meta["reference_vision"] = job.options.get(
+                    "reference_vision", "not_needed"
+                )
+                item["task_meta"] = task_meta
+                items.append(item)
+                child_jobs.append(
+                    PreparedImageJob(
+                        mode=job.mode,
+                        user_prompt=planned.prompt,
+                        effective_prompt=effective_prompt,
+                        backend=job.backend,
+                        output=self._output_intent_dict(item_intent),
+                        input_paths=job.input_paths,
+                        task_meta=task_meta,
+                        options=job.options,
+                    )
+                )
+
+            await manager.transition(
+                task_id,
+                "queued",
+                {
+                    "items": items,
+                    "planned_count": len(items),
+                    "effective_prompt": "",
+                },
+            )
+            generated: dict[str, tuple[Path, dict[str, Any]]] = {}
+            child_limit = asyncio.Semaphore(
+                self._get_batch_concurrency_for_mode(job.mode)
+            )
+            for item, child_job in zip(items, child_jobs, strict=True):
+                child_tasks.append(
+                    manager.start_managed(
+                        self._run_background_batch_child(
+                            manager,
+                            task_id,
+                            item,
+                            child_job,
+                            child_limit,
+                            generated,
+                        ),
+                        name=f"background-batch-child-{item['item_id']}",
+                    )
+                )
+            if child_tasks:
+                await asyncio.gather(*child_tasks)
+
+            await self._wait_for_background_ack(manager, task_id)
+            for item in items:
+                item_id = str(item["item_id"])
+                if manager.is_cancelled(task_id):
+                    raise asyncio.CancelledError
+                generated_result = generated.get(item_id)
+                if generated_result is None:
+                    continue
+                image_path, task_meta = generated_result
+                await self._wait_background_send_gate(target.umo)
+                if manager.is_cancelled(task_id):
+                    raise asyncio.CancelledError
+                send_attempt_id = manager.new_task_id("send")
+                await manager.update_item(
+                    task_id,
+                    item_id,
+                    {
+                        "state": "sending",
+                        "send_attempt_id": send_attempt_id,
+                        "delivery_state": "attempting",
+                    },
+                )
+                await manager.record_receipt(
+                    task_id,
+                    send_attempt_id=send_attempt_id,
+                    item_id=item_id,
+                    kind="image",
+                    delivery_state="attempting",
+                    transport=target.platform_name,
+                )
+                try:
+                    delivery_event = await self._send_background_image_once(
+                        target,
+                        image_path,
+                    )
+                except Exception as exc:
+                    unknown = self._is_unknown_delivery_error(exc)
+                    await manager.record_receipt(
+                        task_id,
+                        send_attempt_id=send_attempt_id,
+                        item_id=item_id,
+                        kind="image",
+                        delivery_state="unknown" if unknown else "not_started",
+                        transport=target.platform_name,
+                        response_digest=hashlib.sha256(str(exc).encode()).hexdigest(),
+                    )
+                    await manager.update_item(
+                        task_id,
+                        item_id,
+                        {
+                            "state": "unknown" if unknown else "failed",
+                            "image_generated": True,
+                            "image_sent": False,
+                            "delivery_state": "unknown" if unknown else "not_started",
+                            "error_code": "delivery_unknown"
+                            if unknown
+                            else "delivery_failed",
+                            "error_message": manager.sanitize_error(exc),
+                        },
+                        release_if_terminal=True,
+                    )
+                    continue
+                await manager.record_receipt(
+                    task_id,
+                    send_attempt_id=send_attempt_id,
+                    item_id=item_id,
+                    kind="image",
+                    delivery_state="confirmed",
+                    transport=target.platform_name,
+                    response_digest=hashlib.sha256(
+                        str(image_path).encode()
+                    ).hexdigest(),
+                )
+                await self._publish_context_result(
+                    delivery_event,
+                    image_path,
+                    task_meta,
+                    receipt=reference_receipt,
+                    task_id=item_id,
+                )
+                self._remember_last_image(delivery_event, image_path)
+                await self._save_last_image_task_meta(delivery_event, task_meta)
+                await manager.update_item(
+                    task_id,
+                    item_id,
+                    {
+                        "task_meta": task_meta,
+                        "state": "completed",
+                        "image_generated": True,
+                        "image_sent": True,
+                        "delivery_state": "confirmed",
+                    },
+                    release_if_terminal=True,
+                )
+
+            current = await manager.get_task(task_id)
+            if current is None:
+                return
+            unknown_count = int(current.get("unknown_count") or 0)
+            sent_count = int(current.get("sent_count") or 0)
+            requested_count = int(current.get("requested_count") or 0)
+            if unknown_count > 0:
+                terminal_state = "interrupted"
+            elif sent_count == requested_count and requested_count > 0:
+                terminal_state = "completed"
+            elif sent_count > 0:
+                terminal_state = "partial"
+            else:
+                terminal_state = "failed"
+            record = await manager.transition(
+                task_id,
+                terminal_state,
+                {
+                    "delivery_state": "unknown"
+                    if unknown_count
+                    else ("confirmed" if sent_count else "not_started"),
+                    "terminal_reason": "batch_finished",
+                },
+                queue_notification=True,
+            )
+            await self._dispatch_background_completion(manager, record, target)
+        except asyncio.CancelledError:
+            for child in child_tasks:
+                child.cancel()
+            if child_tasks:
+                await asyncio.gather(*child_tasks, return_exceptions=True)
+            record = await manager.get_task(task_id)
+            if record and record.get("state") not in TERMINAL_STATES:
+                try:
+                    record = await asyncio.shield(
+                        manager.transition(
+                            task_id,
+                            "interrupted",
+                            {
+                                "error_code": "plugin_shutdown",
+                                "error_message": "The batch image task was interrupted.",
+                                "terminal_reason": "plugin_shutdown",
+                            },
+                            queue_notification=True,
+                        )
+                    )
+                except Exception:
+                    pass
+                else:
+                    await self._dispatch_background_completion(manager, record, target)
+            raise
+        except Exception as exc:
+            logger.error(
+                "[background-image] batch task failed: task=%s err=%s",
+                task_id,
+                manager.sanitize_error(exc),
+                exc_info=True,
+            )
+            record = await manager.get_task(task_id)
+            if record and record.get("state") not in TERMINAL_STATES:
+                record = await manager.transition(
+                    task_id,
+                    "failed",
+                    {
+                        "error_code": "batch_failed",
+                        "error_message": manager.sanitize_error(exc),
+                        "terminal_reason": "batch_failed",
+                    },
+                    queue_notification=True,
+                )
+                await self._dispatch_background_completion(manager, record, target)
+        finally:
+            await manager.cleanup_task_files(task_id)
+
+    def _get_batch_feature(self) -> dict:
+        return self._get_feature("batch")
+
+    def _get_batch_max_count(self) -> int:
+        value = self._as_int(self._get_batch_feature().get("max_count", 8), default=8)
+        return max(1, min(32, value))
+
+    def _get_draw_batch_concurrency(self) -> int:
+        value = self._as_int(
+            self._get_feature("draw").get("batch_concurrency", 2), default=2
+        )
+        return max(1, min(30, value))
+
+    def _get_edit_batch_concurrency(self) -> int:
+        value = self._as_int(
+            self._get_feature("edit").get("batch_concurrency", 2), default=2
+        )
+        return max(1, min(30, value))
+
+    def _get_draw_presets(self) -> dict[str, str]:
+        presets: dict[str, str] = {}
+        conf = self._get_feature("draw")
+        items = conf.get("presets", [])
+        if not isinstance(items, list):
+            return presets
+        for item in items:
+            if isinstance(item, str) and ":" in item:
+                key, val = item.split(":", 1)
+                key = key.strip()
+                val = val.strip()
+                if key and val:
+                    presets[key] = val
+        return presets
+
+    def _parse_structured_image_request(self, text: str) -> ParsedImageRequest | None:
+        edit_presets = dict(getattr(self.edit, "presets", {}) or {})
+        return parse_image_request(
+            text,
+            draw_presets=self._get_draw_presets(),
+            edit_presets=edit_presets,
+            known_provider_ids=set(self.registry.provider_ids()),
+        )
+
+    def _extract_batch_command_fragment(self, event: AstrMessageEvent) -> str:
+        """Extract a batch command from the start of a raw text segment.
+
+        Args:
+            event: Current AstrBot message event.
+
+        Returns:
+            The complete batch command fragment, or an empty string when absent.
+        """
+        try:
+            chain = event.get_messages()
+        except Exception:
+            return ""
+
+        for seg in chain or []:
+            if not isinstance(seg, Plain):
+                continue
+            plain = str(getattr(seg, "text", "") or "").lstrip()
+            for prefix in self._cmd_prefixes():
+                if re.match(
+                    rf"{re.escape(prefix)}批量(?:\s*\d+|\d+)(?:\s|$)",
+                    plain,
+                ):
+                    return plain
+        return ""
+
+    def _batch_mode_label(self, spec: ImageTaskSpec) -> str:
+        if spec.mode == "draw":
+            if spec.preset_name:
+                return f"文生图预设/{spec.preset_name}"
+            return "文生图"
+        if spec.mode == "edit":
+            if spec.preset_name:
+                return f"改图预设/{spec.preset_name}"
+            return "改图"
+        if spec.mode == "selfie_ref":
+            return "自拍"
+        return spec.mode
+
+    def _get_batch_concurrency_for_mode(self, mode: str) -> int:
+        if mode == "draw":
+            return self._get_draw_batch_concurrency()
+        return self._get_edit_batch_concurrency()
+
+    def _resolve_target_backend(self, backend: str | None) -> str | None:
+        raw = str(backend or "auto").strip()
+        known_provider_ids = set(self.registry.provider_ids())
+        if not raw or raw.lower() == "auto":
+            return None
+        if raw in known_provider_ids:
+            return raw
+        logger.warning(
+            "[backend_override] 忽略未知 backend 覆盖，回退自动链路: backend=%s",
+            raw,
+        )
+        return None
+
+    def _get_draw_ratio_default_sizes(self) -> dict[str, str]:
+        conf = self._get_feature("draw")
+        raw = conf.get("ratio_default_sizes", {})
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, str] = {}
+        for ratio, size in raw.items():
+            r = str(ratio or "").strip()
+            s = normalize_size_text(size)
+            if not r or not s:
+                continue
+            out[r] = s
+        return out
+
+    def _resolve_ratio_size(self, ratio: str) -> str:
+        ratio = str(ratio or "").strip()
+        overrides = self._get_draw_ratio_default_sizes()
+        size, warning = resolve_ratio_size(
+            ratio,
+            overrides=overrides,
+            supported_ratios=self.SUPPORTED_RATIOS,
+        )
+        if warning:
+            logger.warning("[aiimg] %s", warning)
+        return size
+
+    def _get_video_presets(self) -> dict[str, str]:
+        presets: dict[str, str] = {}
+        conf = self._get_feature("video")
+        items = conf.get("presets", [])
+        if not isinstance(items, list):
+            return presets
+        for item in items:
+            if isinstance(item, str) and ":" in item:
+                key, val = item.split(":", 1)
+                key = key.strip()
+                val = val.strip()
+                if key and val:
+                    presets[key] = val
+        return presets
+
+    def _get_video_chain(self) -> list[str]:
+        conf = self._get_feature("video")
+        chain = conf.get("chain", [])
+        if not isinstance(chain, list):
+            return []
+        out: list[str] = []
+        for item in chain:
+            pid = self._extract_chain_provider_id(item)
+            if pid and pid not in out:
+                out.append(pid)
+        return out
+
+    def _parse_video_args(self, text: str) -> tuple[str | None, str]:
+        """解析 /视频 参数，返回 (preset, prompt)
+
+        - 当第一个 token 命中预设名时：preset=该 token, prompt=剩余内容
+        - 否则：preset=None, prompt=text
+        """
+        text = (text or "").strip()
+        if not text:
+            return None, ""
+
+        first, _, rest = text.partition(" ")
+        if first and first in self._get_video_presets():
+            return first, rest.strip()
+        return None, text
+
+    async def _prepare_edit_image_bytes(self, event: AstrMessageEvent) -> list[bytes]:
+        image_segs = await get_images_from_event(
+            event,
+            include_avatar=True,
+            include_sender_avatar_fallback=False,
+        )
+        if not image_segs:
+            raise RuntimeError("当前消息没有可用输入图片，无法执行改图批量任务。")
+        bytes_images = await self._image_segs_to_bytes(image_segs)
+        if not bytes_images:
+            raise RuntimeError("当前消息图片读取失败，无法执行改图批量任务。")
+        return bytes_images
+
+    async def _execute_image_task_spec(
+        self,
+        event: AstrMessageEvent,
+        spec: ImageTaskSpec,
+        *,
+        prepared_edit_images: list[bytes] | None = None,
+        size: str | None = None,
+        resolution: str | None = None,
+        output_intent: OutputIntent | None = None,
+    ) -> ExecutedImageTask:
+        effective_output_intent = merge_output_intents(
+            output_intent,
+            parse_output_intent(spec.output) if spec.output else None,
+        )
+
+        if spec.mode == "draw":
+            prompt = str(spec.effective_prompt or spec.user_prompt or "").strip()
+            if not prompt:
+                raise RuntimeError("文生图提示词为空。")
+            image_path = await self.draw.generate(
+                prompt,
+                provider_id=spec.provider_id,
+                size=size,
+                resolution=resolution,
+                output_intent=effective_output_intent,
+            )
+            task_meta = self._build_image_task_meta(
+                mode="text",
+                user_prompt=spec.user_prompt,
+                effective_user_prompt=prompt if spec.preset_name else spec.user_prompt,
+                effective_prompt=prompt,
+                continue_with="text",
+                backend=spec.provider_id,
+            )
+            return ExecutedImageTask(
+                spec=spec, image_path=image_path, task_meta=task_meta
+            )
+
+        if spec.mode == "edit":
+            bytes_images = prepared_edit_images
+            if bytes_images is None:
+                bytes_images = await self._prepare_edit_image_bytes(event)
+            image_path = await self.edit.edit(
+                prompt=spec.user_prompt,
+                images=bytes_images,
+                backend=spec.provider_id,
+                preset=spec.preset_name,
+                size=size,
+                resolution=resolution,
+                output_intent=effective_output_intent,
+            )
+            task_meta = self._build_image_task_meta(
+                mode="edit",
+                user_prompt=spec.user_prompt,
+                effective_user_prompt=spec.effective_prompt,
+                effective_prompt=spec.effective_prompt,
+                continue_with="edit",
+                backend=spec.provider_id,
+            )
+            if spec.preset_name:
+                task_meta["preset_name"] = spec.preset_name
+            return ExecutedImageTask(
+                spec=spec, image_path=image_path, task_meta=task_meta
+            )
+
+        if spec.mode == "selfie_ref":
+            if not self._is_selfie_enabled():
+                raise RuntimeError(self._selfie_disabled_message())
+            image_path, task_meta = await self._generate_selfie_image_with_meta(
+                event,
+                spec.user_prompt,
+                spec.provider_id,
+                size=size,
+                resolution=resolution,
+                output_intent=effective_output_intent,
+            )
+            return ExecutedImageTask(
+                spec=spec, image_path=image_path, task_meta=task_meta
+            )
+
+        raise RuntimeError(f"不支持的图片任务模式: {spec.mode}")
+
+    async def _run_batch_specs(
+        self,
+        event: AstrMessageEvent,
+        specs: list[ImageTaskSpec],
+        *,
+        size: str | None = None,
+        resolution: str | None = None,
+        output_intent: OutputIntent | None = None,
+    ) -> list[BatchRunResult[ExecutedImageTask]]:
+        if not specs:
+            return []
+
+        prepared_edit_images: list[bytes] | None = None
+        if any(spec.mode == "edit" for spec in specs):
+            prepared_edit_images = await self._prepare_edit_image_bytes(event)
+
+        concurrency = self._get_batch_concurrency_for_mode(specs[0].mode)
+
+        async def _runner(index: int, spec: ImageTaskSpec) -> ExecutedImageTask:
+            return await self._execute_image_task_spec(
+                event,
+                spec,
+                prepared_edit_images=prepared_edit_images,
+                size=size,
+                resolution=resolution,
+                output_intent=output_intent,
+            )
+
+        return await run_batch(specs, concurrency=concurrency, runner=_runner)
+
+    async def _remember_batch_success(
+        self,
+        event: AstrMessageEvent,
+        results: list[BatchRunResult[ExecutedImageTask]],
+    ) -> None:
+        for result in reversed(results):
+            if not result.success or result.value is None:
+                continue
+            self._remember_last_image(event, result.value.image_path)
+            await self._save_last_image_task_meta(event, result.value.task_meta)
+            return
+
+    async def _send_batch_results_single(
+        self,
+        event: AstrMessageEvent,
+        results: list[BatchRunResult[ExecutedImageTask]],
+        *,
+        title: str,
+    ) -> None:
+        for result in results:
+            if result.success and result.value is not None:
+                await self._send_image_with_fallback(event, result.value.image_path)
+
+    async def _send_batch_results(
+        self,
+        event: AstrMessageEvent,
+        results: list[BatchRunResult[ExecutedImageTask]],
+        *,
+        title: str,
+    ) -> None:
+        await self._send_batch_results_single(event, results, title=title)
+
+    async def _plan_batch_prompt_items(
+        self,
+        *,
+        mode: str,
+        user_prompt: str,
+        count: int,
+        fixed_aspect_ratio: str | None = None,
+        umo: str | None = None,
+    ) -> list[PlannedPromptItem]:
+        provider = self.context.get_using_provider(umo=umo)
+        if provider is None or not hasattr(provider, "text_chat"):
+            raise RuntimeError("当前没有可用的 LLM 提供商，无法规划批量提示词。")
+
+        planning_prompt = build_batch_planning_prompt(
+            mode=mode,
+            user_prompt=user_prompt,
+            count=count,
+            fixed_aspect_ratio=fixed_aspect_ratio,
+        )
+        last_error: Exception | None = None
+        for _ in range(3):
+            llm_response = await provider.text_chat(
+                prompt=planning_prompt,
+                contexts=[],
+                image_urls=[],
+                func_tool=None,
+                system_prompt=(
+                    "You plan image prompt sets. Output JSON only. "
+                    "No markdown, no code fence, no explanation."
+                ),
+            )
+            text = str(getattr(llm_response, "completion_text", "") or "").strip()
+            if not text:
+                last_error = RuntimeError("LLM returned empty planner output")
+                continue
+            try:
+                items = parse_planned_prompt_items(text)
+                validation_error = validate_planned_prompt_items(
+                    items,
+                    expected_count=count,
+                    fixed_aspect_ratio=fixed_aspect_ratio,
+                )
+                if validation_error is not None:
+                    raise ValueError(validation_error)
+                return items
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"批量提示词规划失败: {last_error}")
+
+    async def _resolve_llm_batch_mode(
+        self, event: AstrMessageEvent, mode: str, prompt: str
+    ) -> str:
+        m = str(mode or "auto").strip().lower()
+        if m in {"text", "draw", "aiimg"}:
+            return "draw"
+        if m in {"edit", "img2img", "aiedit"}:
+            return "edit"
+        if m in {"selfie_ref", "selfie", "ref"}:
+            return "selfie_ref"
+        if m != "auto":
+            return "draw"
+
+        if (
+            self._is_selfie_enabled()
+            and self._is_selfie_llm_enabled()
+            and await self._should_auto_selfie_ref(event, prompt)
+        ):
+            return "selfie_ref"
+
+        if self._context_selection(event):
+            return "edit"
+
+        has_msg_images = await self._has_message_images(event)
+        if has_msg_images:
+            return "edit"
+
+        prefetched_edit_image_segs = await get_images_from_event(
+            event,
+            include_avatar=True,
+            include_sender_avatar_fallback=False,
+        )
+        if prefetched_edit_image_segs:
+            return "edit"
+        return "draw"
+
+    async def _video_begin(self, user_id: str) -> bool:
+        """单用户并发保护：成功占用返回 True，否则 False（上限可配置）"""
+        return await self._begin_user_job(str(user_id or ""), kind="video")
+
+    async def _video_end(self, user_id: str) -> None:
+        await self._end_user_job(str(user_id or ""), kind="video")
+
+    async def _send_video_result(
+        self,
+        event: AstrMessageEvent,
+        video_url: str,
+        *,
+        download_headers: dict[str, str] | None = None,
+        single_request_download: bool = False,
+    ) -> None:
+        vconf = self._get_feature("video")
+        mode = str(vconf.get("send_mode", "auto")).strip().lower()
+        if mode not in {"auto", "url", "file"}:
+            mode = "auto"
+
+        send_timeout = self._as_int(vconf.get("send_timeout_seconds", 90), default=90)
+        send_timeout = max(10, min(send_timeout, 300))
+
+        download_timeout = self._as_int(
+            vconf.get("download_timeout_seconds", 300), default=300
+        )
+        download_timeout = max(1, min(download_timeout, 3600))
+
+        async def _send_file(url: str) -> bool:
+            try:
+                video_path = await self.videomgr.download_video(
+                    url,
+                    timeout_seconds=download_timeout,
+                    headers=download_headers,
+                    single_request_download=single_request_download,
+                )
+                await asyncio.wait_for(
+                    event.send(
+                        event.chain_result([Video.fromFileSystem(str(video_path))])
+                    ),
+                    timeout=float(send_timeout),
+                )
+                return True
+            except Exception as e:
+                logger.warning(f"[视频] 本地文件发送失败: {type(e).__name__}: {e!r}")
+                return False
+
+        async def _send_url(url: str) -> bool:
+            try:
+                await asyncio.wait_for(
+                    event.send(event.chain_result([Video.fromURL(url)])),
+                    timeout=float(send_timeout),
+                )
+                return True
+            except Exception as e:
+                logger.warning(f"[视频] URL 发送失败: {e}")
+                return False
+
+        if download_headers:
+            if await _send_file(video_url):
+                return
+            raise RuntimeError("鉴权视频下载失败")
+
+        # file/url forced
+        if mode == "file":
+            if await _send_file(video_url):
+                return
+            raise RuntimeError("视频文件发送失败")
+
+        if mode == "url":
+            if await _send_url(video_url):
+                return
+            raise RuntimeError("视频 URL 发送失败")
+
+        if await _send_url(video_url):
+            return
+        if await _send_file(video_url):
+            return
+        raise RuntimeError("视频 URL 和本地文件发送均失败")
+
+    async def _async_generate_video(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        user_id: str,
+        *,
+        provider_id: str | None = None,
+        llm_tool_failure: bool = False,
+        image_snapshot: tuple[bool, bytes | None] | None = None,
+        selfie_snapshot: tuple[list[bytes], str, dict, dict] | None = None,
+    ) -> None:
+        try:
+            if selfie_snapshot is not None:
+                images, still_prompt, options, _ = selfie_snapshot
+                if not images:
+                    raise RuntimeError("自拍视频缺少身份参考, 不会改用文生视频")
+                logger.info("[视频] 阶段=selfie_frame 开始生成自拍视频底图")
+
+                async def make_frame():
+                    return await self.edit.edit(
+                        prompt=still_prompt,
+                        images=images,
+                        task_types=options.get("task_types"),
+                        default_output=options.get("default_output"),
+                        chain_override=options.get("chain_override"),
+                        infer_source_aspect=False,
+                    )
+
+                manager = getattr(self, "background_tasks", None)
+                if manager and manager.accepting:
+                    path = await manager.run_provider(
+                        "selfie-video-" + uuid.uuid4().hex, make_frame
+                    )
+                else:
+                    path = await make_frame()
+                image_bytes = await asyncio.to_thread(Path(path).read_bytes)
+                if not image_bytes:
+                    raise RuntimeError("自拍视频底图为空, 未提交视频任务")
+                self._remember_last_image(event, Path(path))
+                image_snapshot = (True, image_bytes)
+                logger.info(
+                    "[视频] 阶段=animate 自拍底图已固定, bytes=%s", len(image_bytes)
+                )
+            elif image_snapshot is None:
+                image_snapshot = await self._capture_video_image_snapshot(event)
+            had_image, image_bytes = image_snapshot
+
+            # 允许文生视频（无图）走支持的后端；但若用户确实发了图却读不到，则直接失败
+            if had_image and not image_bytes:
+                if llm_tool_failure:
+                    await self._append_plugin_conversation_note(
+                        event,
+                        "The last video generation task failed and has ended because the source image could not be read. Do not retry automatically unless the user explicitly asks.",
+                    )
+                if llm_tool_failure:
+                    await self._signal_llm_tool_failure(event)
+                else:
+                    await mark_failed(event)
+                return
+
+            t_start = time.perf_counter()
+            candidates = (
+                [str(provider_id).strip()] if provider_id else self._get_video_chain()
+            )
+            candidates = [c for c in candidates if c]
+            if not candidates:
+                raise RuntimeError(
+                    "No video providers configured. Please set features.video.chain."
+                )
+
+            last_error: Exception | None = None
+            used_pid: str | None = None
+            for pid in candidates:
+                try:
+                    backend = self.registry.get_video_backend(pid)
+                    candidate_result = await backend.generate_video_url(
+                        prompt=prompt, image_bytes=image_bytes
+                    )
+                    candidate_url = str(
+                        getattr(candidate_result, "url", candidate_result) or ""
+                    ).strip()
+                    if not candidate_url:
+                        raise RuntimeError("Provider returned empty video url")
+                    candidate_headers = getattr(
+                        candidate_result, "download_headers", None
+                    )
+                    download_headers = (
+                        dict(candidate_headers)
+                        if isinstance(candidate_headers, dict)
+                        else None
+                    )
+                    single_request_download = bool(
+                        getattr(candidate_result, "single_request_download", False)
+                    )
+                    # A provider is only considered successful after the media
+                    # has actually been downloaded/sent. This lets the chain
+                    # recover when task creation succeeds but content delivery
+                    # fails (the original 3365 failure mode).
+                    await self._send_video_result(
+                        event,
+                        candidate_url,
+                        download_headers=download_headers,
+                        single_request_download=single_request_download,
+                    )
+                    used_pid = pid
+                    break
+                except Exception as e:
+                    last_error = e
+                    detail = str(e).strip() or repr(e)
+                    logger.warning(
+                        "[视频] Provider=%s 失败: %s (%s)",
+                        pid,
+                        detail,
+                        type(e).__name__,
+                    )
+                    if getattr(e, "stop_provider_chain", False):
+                        break
+
+            if not used_pid:
+                if last_error is not None:
+                    detail = str(last_error).strip() or repr(last_error)
+                    raise RuntimeError(f"视频生成失败: {detail}") from last_error
+                raise RuntimeError("视频生成失败: 没有可用的视频 provider")
+
+            await mark_success(event)
+            if llm_tool_failure:
+                await self._append_plugin_conversation_note(
+                    event,
+                    "The last video generation task has completed and the video was already sent to the user. Do not continue or resubmit this task unless the user explicitly asks for another video.",
+                )
+
+            t_end = time.perf_counter()
+            name = used_pid or "video"
+            logger.info(f"[视频] 完成: provider={name}, 耗时={t_end - t_start:.2f}s")
+
+        except Exception as e:
+            logger.error(f"[视频] 失败: {e}", exc_info=True)
+            if llm_tool_failure:
+                await self._append_plugin_conversation_note(
+                    event,
+                    "The last video generation task failed and has ended. Reason: "
+                    + self._summarize_status_text(
+                        e,
+                        fallback="unknown error",
+                    )
+                    + ". Do not retry automatically unless the user explicitly asks.",
+                )
+            if llm_tool_failure:
+                await self._signal_llm_tool_failure(event)
+            else:
+                await mark_failed(event)
+        finally:
+            await self._video_end(user_id)
+
+    async def _do_edit_direct(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        backend: str | None = None,
+        preset: str | None = None,
+    ):
+        """改图执行入口 (非 generator 版本，用于动态注册的命令)
+
+        使用 event.send() 直接发送消息，不使用 yield
+        """
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "edit", user_id)
+
+        # 防抖
+        if self.debouncer.hit(request_id):
+            await mark_failed(event)
+            return
+
+        p = (prompt or "").strip()
+        if backend is None:
+            override, rest = self._parse_provider_override_prefix(p)
+            if override:
+                backend = override
+                prompt = rest
+        try:
+            prompt, output_intent = split_prompt_output_suffix(prompt)
+        except ValueError as exc:
+            logger.warning("[改图] 输出参数无效: %s", exc)
+            await mark_failed(event)
+            return
+
+        # 获取图片
+        image_segs = await get_images_from_event(
+            event,
+            include_avatar=True,
+            include_sender_avatar_fallback=False,
+        )
+        logger.debug(f"[改图] 获取到 {len(image_segs)} 个图片段")
+        if not image_segs:
+            await mark_failed(event)
+            return
+
+        bytes_images: list[bytes] = []
+        for i, seg in enumerate(image_segs):
+            try:
+                logger.debug(f"[改图] 转换图片 {i + 1}/{len(image_segs)}...")
+                b64 = await seg.convert_to_base64()
+                bytes_images.append(decode_base64_image_payload(b64))
+                logger.debug(
+                    f"[改图] 图片 {i + 1} 转换成功, 大小={len(bytes_images[-1])} bytes"
+                )
+            except Exception as e:
+                logger.warning(f"[改图] 图片 {i + 1} 转换失败，跳过: {e}")
+
+        if not bytes_images:
+            await mark_failed(event)
+            return
+
+        if not await self._begin_user_job(user_id, kind="image"):
+            await mark_failed(event)
+            return
+
+        try:
+            # 标记处理中
+            await mark_processing(event)
+            t_start = time.perf_counter()
+            image_path = await self.edit.edit(
+                prompt=prompt,
+                images=bytes_images,
+                backend=backend,
+                preset=preset,
+                output_intent=output_intent,
+            )
+            t_end = time.perf_counter()
+
+            self._remember_last_image(event, image_path)
+            sent = await self._send_image_with_fallback(event, image_path)
+            if not sent:
+                await mark_failed(event)
+                logger.warning(
+                    "[改图] 结果发送失败，已仅使用表情标注: reason=%s",
+                    sent.reason,
+                )
+                return
+
+            # 标记成功
+            await mark_success(event)
+            display_name = preset or (prompt[:20] if prompt else "改图")
+            logger.info(f"[改图] 完成: {display_name}..., 耗时={t_end - t_start:.2f}s")
+
+        except Exception as e:
+            logger.error(f"[改图] 失败: {e}", exc_info=True)
+            await mark_failed(event)
+        finally:
+            await self._end_user_job(user_id, kind="image")
+
+    async def _do_edit(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        backend: str | None = None,
+        preset: str | None = None,
+    ):
+        """统一改图执行入口
+
+        预设触发逻辑:
+        1. 如果 preset 参数已指定，直接使用
+        2. 否则检查 prompt 是否匹配预设名，若匹配则自动转为预设
+        3. 都不匹配则作为普通提示词处理
+        """
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "edit", user_id)
+
+        # 防抖
+        if self.debouncer.hit(request_id):
+            await mark_failed(event)
+            return
+
+        # Optional provider override: "/aiedit @provider_id <prompt>"
+        p = (prompt or "").strip()
+        if backend is None:
+            override, rest = self._parse_provider_override_prefix(p)
+            if override:
+                backend = override
+                prompt = rest
+        try:
+            prompt, output_intent = split_prompt_output_suffix(prompt)
+        except ValueError as exc:
+            logger.warning("[改图] 输出参数无效: %s", exc)
+            await mark_failed(event)
+            return
+
+        # 预设自动检测: prompt 完全匹配预设名时，自动转为预设
+        if not preset and prompt:
+            prompt_stripped = prompt.strip()
+            preset_names = self.edit.get_preset_names()
+            if prompt_stripped in preset_names:
+                preset = prompt_stripped
+                prompt = ""  # 清空 prompt，使用预设的提示词
+                logger.debug(f"[改图] 自动匹配预设: {preset}")
+
+        # 获取图片
+        image_segs = await get_images_from_event(
+            event,
+            include_avatar=True,
+            include_sender_avatar_fallback=False,
+        )
+        if not image_segs:
+            await mark_failed(event)
+            return
+
+        bytes_images: list[bytes] = []
+        for seg in image_segs:
+            try:
+                b64 = await seg.convert_to_base64()
+                bytes_images.append(decode_base64_image_payload(b64))
+            except Exception as e:
+                logger.warning(f"[改图] 图片转换失败，跳过: {e}")
+
+        if not bytes_images:
+            await mark_failed(event)
+            return
+
+        if not await self._begin_user_job(user_id, kind="image"):
+            await mark_failed(event)
+            return
+
+        try:
+            # 标记处理中
+            await mark_processing(event)
+            t_start = time.perf_counter()
+            image_path = await self.edit.edit(
+                prompt=prompt,
+                images=bytes_images,
+                backend=backend,
+                preset=preset,
+                output_intent=output_intent,
+            )
+            t_end = time.perf_counter()
+
+            self._remember_last_image(event, image_path)
+            sent = await self._send_image_with_fallback(event, image_path)
+            if not sent:
+                await mark_failed(event)
+                logger.warning(
+                    "[改图] 结果发送失败，已仅使用表情标注: reason=%s",
+                    sent.reason,
+                )
+                return
+
+            # 标记成功
+            await mark_success(event)
+            display_name = preset or (prompt[:20] if prompt else "改图")
+            logger.info(f"[改图] 完成: {display_name}..., 耗时={t_end - t_start:.2f}s")
+
+        except Exception as e:
+            logger.error(f"[改图] 失败: {e}")
+            await mark_failed(event)
+        finally:
+            await self._end_user_job(user_id, kind="image")
+
+    # ==================== 自拍参考照：内部实现 ====================
+
+    def _get_selfie_conf(self) -> dict:
+        return self._get_feature("selfie")
+
+    def _get_selfie_default_output(self) -> str | None:
+        conf = self._get_selfie_conf()
+        default_output_text = str(conf.get("default_output") or "").strip()
+        default_aspect_ratio = (
+            normalize_aspect_ratio(conf.get("default_aspect_ratio")) or "3:4"
+        )
+        default_output_intent = merge_output_intents(
+            parse_output_intent(default_output_text) if default_output_text else None,
+            OutputIntent(aspect_ratio=default_aspect_ratio),
+        )
+        return format_output_intent(default_output_intent) or None
+
+    async def _ensure_tool_image_cache_dir(self) -> None:
+        tool_image_dir = Path(get_astrbot_temp_path()) / "tool_images"
+        await asyncio.to_thread(tool_image_dir.mkdir, parents=True, exist_ok=True)
+
+    async def _build_llm_tool_image_result(
+        self, image_path: Path
+    ) -> mcp.types.CallToolResult | None:
+        try:
+            image_bytes = await asyncio.to_thread(Path(image_path).read_bytes)
+        except Exception as exc:
+            logger.warning(
+                "[aiimg_generate] failed to read image for LLM context: path=%s err=%s",
+                image_path,
+                exc,
+            )
+            return None
+
+        if not image_bytes:
+            logger.warning(
+                "[aiimg_generate] skip empty image for LLM context: path=%s",
+                image_path,
+            )
+            return None
+
+        mime_type, _ = guess_image_mime_and_ext(image_bytes)
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        return mcp.types.CallToolResult(
+            content=[
+                mcp.types.ImageContent(
+                    type="image",
+                    data=image_b64,
+                    mimeType=mime_type,
+                )
+            ]
+        )
+
+    async def _finalize_llm_tool_image(
+        self,
+        event: AstrMessageEvent,
+        image_path: Path,
+        *,
+        task_meta: dict[str, Any],
+    ) -> mcp.types.CallToolResult:
+        self._remember_last_image(event, image_path)
+
+        sent = await self._send_image_with_fallback(event, image_path)
+        if not sent:
+            await self._signal_llm_tool_failure(event)
+            logger.warning(
+                "[aiimg_generate] image send failed, emoji fallback only: reason=%s",
+                sent.reason,
+            )
+            return self._llm_tool_text_result(
+                "Image generation finished, but sending the image to the user failed. This request has ended. Do not retry automatically unless the user explicitly asks."
+            )
+
+        await self._publish_context_result(event, image_path, task_meta)
+        await mark_success(event)
+        await self._save_last_image_task_meta(event, task_meta)
+        return self._build_image_task_completion_result(task_meta)
+
+    def _get_selfie_ref_store_key(self, event: AstrMessageEvent) -> str:
+        """用于 ReferenceStore 的固定 key（按 bot self_id 隔离）。"""
+        self_id = ""
+        try:
+            if hasattr(event, "get_self_id"):
+                self_id = str(event.get_self_id() or "").strip()
+        except Exception:
+            self_id = ""
+        return f"bot_selfie_{self_id}" if self_id else "bot_selfie"
+
+    def _resolve_data_rel_path(self, rel_path: str) -> Path | None:
+        """将 data_dir 下的相对路径解析为绝对路径，并阻止路径穿越。"""
+        if not isinstance(rel_path, str) or not rel_path.strip():
+            return None
+        rel = rel_path.replace("\\", "/").lstrip("/")
+        parts = [p for p in rel.split("/") if p]
+        if any(p in {".", ".."} for p in parts):
+            return None
+        base = Path(self.data_dir).resolve(strict=False)
+        target = (base / "/".join(parts)).resolve(strict=False)
+        try:
+            target.relative_to(base)
+        except ValueError:
+            return None
+        return target
+
+    def _get_config_selfie_reference_paths(self) -> list[Path]:
+        """从 WebUI file 配置项读取参考图路径。"""
+        conf = self._get_selfie_conf()
+        ref_list = conf.get("reference_images", [])
+        if not isinstance(ref_list, list):
+            return []
+
+        paths: list[Path] = []
+        for rel_path in ref_list:
+            p = self._resolve_data_rel_path(str(rel_path))
+            if not p:
+                continue
+            if p.is_file():
+                paths.append(p)
+        return paths
+
+    async def _get_selfie_reference_paths(
+        self, event: AstrMessageEvent
+    ) -> tuple[list[Path], str]:
+        """返回(路径列表, 来源)；来源=webui/store/none"""
+        studio = getattr(self, "studio", None)
+        if studio:
+            characters = [
+                c
+                for c in studio.store.documents("character")
+                if c.get("kind") == "bot"
+                and (not c.get("bot_id") or c["bot_id"] == str(event.get_self_id()))
+            ]
+            if len(characters) > 1:
+                raise ValueError("当前 Bot 存在多个身份, 请在形象库指定 Bot 账号")
+            if characters:
+                c = characters[0]
+                selected = studio.store.document(
+                    "appearance", str(event.unified_msg_origin) + ":" + c["id"]
+                )
+                name = selected["look"] if selected else c["active_look"]
+                look = next((x for x in c["looks"] if x["name"] == name), None)
+                if not look:
+                    raise ValueError("所选形象不存在, 请使用 /换形象 重新选择")
+                return [
+                    studio.store.asset_path(a) for a in look["assets"]
+                ], "character_library"
+        webui_paths = self._get_config_selfie_reference_paths()
+        if webui_paths:
+            return webui_paths, "webui"
+
+        store_key = self._get_selfie_ref_store_key(event)
+        store_paths = await self.refs.get_paths(store_key)
+        if store_paths:
+            return store_paths, "store"
+
+        return [], "none"
+
+    async def _read_paths_bytes(self, paths: list[Path]) -> list[bytes]:
+        out: list[bytes] = []
+        for p in paths:
+            try:
+                data = await asyncio.to_thread(p.read_bytes)
+            except Exception:
+                continue
+            if data:
+                out.append(data)
+        return out
+
+    async def _image_segs_to_bytes(self, image_segs: list) -> list[bytes]:
+        """将 Image 组件列表转换为 bytes。"""
+        out: list[bytes] = []
+        for seg in image_segs:
+            try:
+                b64 = await seg.convert_to_base64()
+                out.append(decode_base64_image_payload(b64))
+            except Exception as e:
+                logger.warning(f"[图片] 转换失败，跳过: {e}")
+        return out
+
+    async def _has_message_images(self, event: AstrMessageEvent) -> bool:
+        """仅检测用户消息/引用里的图片（不含头像兜底）。"""
+        image_segs = await get_images_from_event(event, include_avatar=False)
+        return bool(image_segs)
+
+    async def _has_message_images_or_avatar_mentions(
+        self, event: AstrMessageEvent
+    ) -> bool:
+        if await self._has_message_images(event):
+            return True
+        return any(str(uid).isdigit() for uid in collect_at_user_ids(event))
+
+    def _is_auto_selfie_prompt(self, prompt: str) -> bool:
+        text = (prompt or "").strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        if "自拍" in text or "selfie" in lowered:
+            return True
+        if any(
+            k in text
+            for k in (
+                "来一张你",
+                "来张你",
+                "你来一张",
+                "你来张",
+                "看看你",
+                "你自己",
+                "你本人",
+                "你的照片",
+                "你的自拍",
+                "你自己的照片",
+                "你自己的自拍",
+                "你长什么样",
+                "看看你本人",
+                "看看你自己",
+                "bot自拍",
+                "机器人自拍",
+            )
+        ):
+            return True
+        if any(
+            k in lowered
+            for k in ("your selfie", "your photo", "your picture", "your face")
+        ):
+            return True
+        return False
+
+    async def _should_auto_selfie_ref(
+        self, event: AstrMessageEvent, prompt: str
+    ) -> bool:
+        if not self._is_auto_selfie_prompt(prompt):
+            logger.debug("[aiimg_generate] auto-selfie skipped: prompt not selfie")
+            return False
+        if await self._has_message_images(event):
+            text = (prompt or "").strip().lower()
+            if "自拍" not in text and "selfie" not in text:
+                logger.info(
+                    "[aiimg_generate] auto-selfie skipped: message has input image for edit"
+                )
+                return False
+        paths, source = await self._get_selfie_reference_paths(event)
+        if not paths:
+            logger.info("[aiimg_generate] auto-selfie skipped: no reference images")
+            return False
+        logger.debug(
+            "[aiimg_generate] auto-selfie candidate: refs=%s source=%s",
+            len(paths),
+            source,
+        )
+        return True
+
+    async def _get_life_context_without_llm(self) -> dict[str, Any]:
+        """Read today's cached life schedule without triggering generation.
+
+        Returns:
+            The optional life scheduler context, or an empty dictionary when it
+            is unavailable or does not support the read-only API.
+        """
+        get_registered_star = getattr(self.context, "get_registered_star", None)
+        if not callable(get_registered_star):
+            return {}
+        try:
+            metadata = get_registered_star("astrbot_plugin_life_scheduler")
+            life_scheduler = getattr(metadata, "star_cls", None)
+            get_context = getattr(life_scheduler, "get_life_context", None)
+            if not callable(get_context):
+                return {}
+            result = get_context(allow_generate=False)
+            if inspect.isawaitable(result):
+                result = await result
+            return result if isinstance(result, dict) else {}
+        except TypeError:
+            # Never retry without the keyword: older implementations may invoke
+            # the LLM whenever their cache is empty.
+            logger.debug(
+                "[selfie] life_scheduler does not support read-only context access"
+            )
+            return {}
+        except Exception as exc:
+            logger.debug("[selfie] life_scheduler context unavailable: %s", exc)
+            return {}
+
+    def _build_selfie_prompt(
+        self,
+        prompt: str,
+        extra_refs: int,
+        life_context: dict[str, Any] | None = None,
+        reference_note: str = "",
+    ) -> str:
+        conf = self._get_selfie_conf()
+        prefix = str(conf.get("prompt_prefix", "") or "").strip()
+        if reference_note and not prefix:
+            prefix = (
+                "根据用户要求制作人物与参考主体的合影。第1张图仅提供人物身份；"
+                "其余图片严格按各自用途保留具体主体，照片质感仅默认作用于人物和环境。"
+                "主体形象的夸张比例、原有材质和画风均是身份特征，不要纠正为普通写实形象。"
+            )
+        if not prefix:
+            prefix = (
+                "请根据参考图创作一张符合用户要求的人像图片：\n"
+                "1) 仅以第1张参考图的人脸五官、脸型与发色特征为准（Face & Hair Identity ONLY，单人画面 solo 1 person），保持五官/气质一致，严禁照搬或复制第1张参考图原有的姿势、镜头角度、服装和背景。\n"
+                "2) 如果还有其它参考图，请将它们仅作为服装/姿势/构图/场景的参考。\n"
+                "3) 用户指定的图像类型、拍摄视角、构图、动作、光线、色调和风格具有最高优先级，不得擅自改成其它拍摄方式或摄影风格。\n"
+                "4) 未指定风格时使用自然真实的照片质感，保留自然光影和真实皮肤纹理，细节清楚但不过度锐化、磨皮或美化。\n"
+                "5) 不要拼图，不要水印，避免明显失真或不合理细节。"
+            )
+
+        if reference_note:
+            # The legacy default treats all extra images as scene/style refs.
+            # Replace that exact clause rather than appending contradictory
+            # animal/object identity requirements below it.
+            prefix = prefix.replace(
+                "2) 如果还有其它参考图，请将它们仅作为服装/姿势/构图/场景的参考。",
+                "2) 每张参考图按下方用途分别约束人物、动物、物体或场景，不得把具体主体降为泛泛的风格参考。",
+            )
+            prefix += (
+                "\n\n本次参考图用途（优先于通用照片风格和额外参考默认说明，用户明确修改要求仍优先）：\n"
+                + reference_note
+            )
+
+        user_prompt = (prompt or "").strip() or "自然真实的人像照片"
+        life_context = life_context if isinstance(life_context, dict) else {}
+        outfit = str(life_context.get("outfit") or "").strip()
+        schedule = str(life_context.get("schedule") or "").strip()
+        life_context_note = ""
+        if outfit or schedule:
+            life_context_note = (
+                "\n\n今日生活状态（仅作为默认背景；用户本次明确要求优先）：\n"
+                f"- 今日穿搭：{outfit or '未记录'}\n"
+                f"- 今日日程：{schedule or '未记录'}\n"
+                "如果用户没有指定其它穿搭或场景，应让画面自然体现上述状态；"
+                "用户明确指定的内容不得被这份状态覆盖。"
+            )
+        else:
+            from .core.studio_characters import sample_random_portrait_variation
+
+            variation = sample_random_portrait_variation()
+            life_context_note = (
+                "\n\n本次随机创意灵感（当用户未明确指定具体动作、穿搭或场景时采用，必须彻底抛弃参考图原有的姿势、衣服和背景重新构图）：\n"
+                f"- 动作与姿态：{variation['pose']}\n"
+                f"- 镜头与景别：{variation['framing']}\n"
+                f"- 穿搭设计：{variation['outfit']}\n"
+                f"- 场景与光影：{variation['scene']}\n"
+                "若用户已明确指定穿搭、动作或背景，则以用户要求为准；严禁照搬第1张身份参考图原有的姿势、服装和背景。"
+            )
+        capture_policy = (
+            "拍摄设备一致性（不得改变用户指定的拍摄视角）：普通手持自拍或前置摄像头自拍时，"
+            "拍摄设备位于画面外，不要在成片中额外生成手机、屏幕或相机界面；"
+            "仅当用户明确要求对镜自拍、手机入镜或展示拍摄设备时，才让相应设备自然出现，"
+            "并保持数量、持握位置和镜面反射合理，不要复制或无故增加其它拍摄设备。"
+            "第三人拍摄、恋人视角或定时拍摄时，"
+            "也不要无故添加拍摄设备或拍摄界面。人物手势和手持日常物品遵循用户要求。"
+            "以上规则只用于保持拍摄逻辑一致，不得覆盖或改写用户明确要求。"
+        )
+        if reference_note:
+            capture_policy = (
+                "拍摄设备只在用户明确要求时入镜；不要把参考图里的物品误作额外拍摄设备。"
+                "保持用户要求的视角、动作和持物。无水印、不拼图。"
+            )
+        extra_ref_note = f"\n（额外参考图数量：{extra_refs}）" if extra_refs > 0 else ""
+        return (
+            f"{prefix}{extra_ref_note}{life_context_note}\n\n"
+            f"用户要求（最高优先级）：{user_prompt}"
+            f"\n\n{capture_policy}"
+        )
+
+    def _merge_selfie_chain_with_edit_chain(
+        self, selfie_chain: list[object]
+    ) -> list[dict]:
+        """将自拍链路与改图链路合并（自拍优先，去重 provider_id）。"""
+        merged: list[dict] = []
+        seen: set[str] = set()
+
+        def append_unique(items: list) -> None:
+            for item in items:
+                normalized = self._normalize_chain_item(item)
+                if not normalized:
+                    continue
+                pid = str(normalized.get("provider_id") or "").strip()
+                if not pid or pid in seen:
+                    continue
+                merged.append(normalized)
+                seen.add(pid)
+
+        append_unique(selfie_chain)
+
+        edit_chain_raw = self._get_feature("edit").get("chain", [])
+        if isinstance(edit_chain_raw, list):
+            append_unique(edit_chain_raw)
+
+        return merged
+
+    async def _generate_selfie_image_with_meta(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        backend: str | None,
+        *,
+        size: str | None = None,
+        resolution: str | None = None,
+        output_intent: OutputIntent | None = None,
+        follow_up_meta: dict[str, Any] | None = None,
+    ) -> tuple[Path, dict[str, Any]]:
+        conf = self._get_selfie_conf()
+        if not self._is_selfie_enabled():
+            raise RuntimeError(self._selfie_disabled_message())
+
+        # 1) 读取参考照（WebUI 优先，其次命令设置的 store）
+        ref_paths, ref_source = await self._get_selfie_reference_paths(event)
+        ref_images = await self._read_paths_bytes(ref_paths)
+        if not ref_images:
+            raise RuntimeError(
+                "未设置自拍参考照。请先：发送图片 + /自拍参考 设置，或在 WebUI 配置 features.selfie.reference_images 上传。"
+            )
+        if len(ref_images) > 1:
+            ref_images = [random.choice(ref_images)]
+
+        # 2) 读取额外参考图（衣服/姿势/场景）
+        extra_segs = await get_images_from_event(event, include_avatar=False)
+        extra_bytes = await self._image_segs_to_bytes(extra_segs)
+
+        # 3) 拼接输入图：参考照在前
+        images = [*ref_images, *extra_bytes]
+        selection = self._context_selection(event)
+        reference_note = ""
+        if selection:
+            images, reference_note = compose_inputs(
+                selection, extra_bytes, identity_images=ref_images
+            )
+            extra_bytes = images[len(ref_images) :]
+
+        effective_user_prompt = self._build_selfie_follow_up_prompt(
+            prompt, follow_up_meta
+        )
+        life_context = await self._get_life_context_without_llm()
+        vision_state = "not_needed"
+        if selection:
+            try:
+                provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+            except Exception:
+                provider = None
+            note, vision_state = await describe_reference_objects(
+                provider, images, selection.sources, len(ref_images)
+            )
+            if note:
+                reference_note += "\n" + note
+
+        final_prompt = self._build_selfie_prompt(
+            effective_user_prompt,
+            extra_refs=len(extra_bytes),
+            life_context=life_context,
+            reference_note=reference_note,
+        )
+
+        chain_override: list[dict] | None = None
+        use_edit_chain = bool(conf.get("use_edit_chain_when_empty", True))
+        raw_chain = conf.get("chain", [])
+        if isinstance(raw_chain, list):
+            chain_items = [
+                normalized
+                for normalized in (self._normalize_chain_item(x) for x in raw_chain)
+                if normalized is not None
+            ]
+            if chain_items:
+                chain_override = chain_items
+
+        if backend is None:
+            if chain_override is None:
+                if not use_edit_chain:
+                    raise RuntimeError(
+                        "No selfie provider chain configured. Please set features.selfie.chain or enable features.selfie.use_edit_chain_when_empty."
+                    )
+            elif use_edit_chain:
+                # 自拍链路可作为主链，改图链路作为补充兜底，避免"自拍链仅一项导致无兜底"。
+                chain_override = self._merge_selfie_chain_with_edit_chain(
+                    chain_override
+                )
+
+        if chain_override:
+            logger.debug(
+                "[selfie] effective providers=%s",
+                [
+                    str(x.get("provider_id") or "").strip()
+                    for x in chain_override
+                    if isinstance(x, dict)
+                ],
+            )
+
+        # 4) 千问后端可选 task_types（仅对 gitee 生效）
+        task_types = conf.get("gitee_task_types")
+        if isinstance(task_types, list) and task_types:
+            gitee_task_types = [str(x).strip() for x in task_types if str(x).strip()]
+        else:
+            gitee_task_types = ["id", "background", "style"]
+
+        default_output = self._get_selfie_default_output()
+
+        image_path = await self.edit.edit(
+            prompt=final_prompt,
+            images=images,
+            **(
+                {"require_ordered_references": True}
+                if selection or len(images) > 1
+                else {}
+            ),
+            backend=backend,
+            task_types=gitee_task_types,
+            size=size,
+            resolution=resolution,
+            output_intent=output_intent,
+            default_output=default_output,
+            chain_override=chain_override,
+            infer_source_aspect=False,
+        )
+        task_meta = self._build_image_task_meta(
+            mode="selfie_ref",
+            user_prompt=prompt,
+            effective_user_prompt=effective_user_prompt,
+            effective_prompt=final_prompt,
+            reference_source=ref_source,
+            reference_count=len(ref_images),
+            extra_reference_count=len(extra_bytes),
+            continue_with="selfie_ref",
+            follow_up=follow_up_meta is not None,
+            backend=backend,
+        )
+        if selection:
+            task_meta["reference_sources"] = list(selection.sources)
+            task_meta["reference_vision"] = vision_state
+        return image_path, task_meta
+
+    async def _generate_selfie_image(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        backend: str | None,
+        *,
+        size: str | None = None,
+        resolution: str | None = None,
+        output_intent: OutputIntent | None = None,
+    ) -> Path:
+        image_path, _ = await self._generate_selfie_image_with_meta(
+            event,
+            prompt,
+            backend,
+            size=size,
+            resolution=resolution,
+            output_intent=output_intent,
+        )
+        return image_path
+
+    async def _do_selfie(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        backend: str | None = None,
+    ):
+        """指令 /自拍 执行入口。"""
+        if not self._is_selfie_enabled():
+            await mark_failed(event)
+            return
+
+        user_id = str(event.get_sender_id() or "")
+        request_id = self._debounce_key(event, "selfie", user_id)
+
+        if self.debouncer.hit(request_id):
+            await mark_failed(event)
+            return
+
+        p = (prompt or "").strip()
+        if backend is None:
+            override, rest = self._parse_provider_override_prefix(p)
+            if override:
+                backend = override
+                prompt = rest
+        try:
+            prompt, output_intent = split_prompt_output_suffix(prompt)
+        except ValueError as exc:
+            logger.warning("[自拍] 输出参数无效: %s", exc)
+            await mark_failed(event)
+            return
+
+        if not await self._begin_user_job(user_id, kind="image"):
+            await mark_failed(event)
+            return
+
+        try:
+            await mark_processing(event)
+            image_path, task_meta = await self._generate_selfie_image_with_meta(
+                event,
+                prompt,
+                backend,
+                output_intent=output_intent,
+            )
+            self._remember_last_image(event, image_path)
+            sent = await self._send_image_with_fallback(event, image_path)
+            if not sent:
+                await mark_failed(event)
+                logger.warning(
+                    "[自拍] 结果发送失败，已仅使用表情标注: reason=%s",
+                    sent.reason,
+                )
+                return
+            await mark_success(event)
+            await self._save_last_image_task_meta(event, task_meta)
+        except Exception as e:
+            logger.error(f"[自拍] 失败: {e}", exc_info=True)
+            await mark_failed(event)
+        finally:
+            await self._end_user_job(user_id, kind="image")
+
+    async def _set_selfie_reference(self, event: AstrMessageEvent):
+        if not self._is_selfie_enabled():
+            await mark_failed(event)
+            return
+
+        image_segs = await get_images_from_event(event, include_avatar=False)
+        if not image_segs:
+            await mark_failed(event)
+            return
+
+        bytes_images = await self._image_segs_to_bytes(image_segs)
+        if not bytes_images:
+            await mark_failed(event)
+            return
+
+        # 限制数量，避免一次塞太多
+        max_images = 8
+        bytes_images = bytes_images[:max_images]
+
+        store_key = self._get_selfie_ref_store_key(event)
+        try:
+            await self.refs.set(store_key, bytes_images)
+        except Exception:
+            await mark_failed(event)
+            return
+
+        await mark_success(event)
+
+    async def _show_selfie_reference(self, event: AstrMessageEvent):
+        if not self._is_selfie_enabled():
+            await mark_failed(event)
+            return
+
+        paths, source = await self._get_selfie_reference_paths(event)
+        if not paths:
+            await mark_failed(event)
+            return
+
+        # 最多回显 5 张，避免刷屏
+        max_show = 5
+        show_paths = paths[:max_show]
+        yield event.chain_result([Image.fromFileSystem(str(p)) for p in show_paths])
+        yield event.plain_result(
+            f"📌 当前自拍参考照来源：{source}，共 {len(paths)} 张（已展示 {len(show_paths)} 张）"
+        )
+
+    async def _delete_selfie_reference(self, event: AstrMessageEvent):
+        if not self._is_selfie_enabled():
+            await mark_failed(event)
+            return
+
+        store_key = self._get_selfie_ref_store_key(event)
+        deleted = await self.refs.delete(store_key)
+
+        webui_paths = self._get_config_selfie_reference_paths()
+        if webui_paths:
+            logger.info(
+                "[自拍参考] 命令保存的参考照已删除，但 WebUI reference_images 仍生效（优先级更高）"
+            )
+
+        if deleted:
+            await mark_success(event)
+        else:
+            await mark_failed(event)
